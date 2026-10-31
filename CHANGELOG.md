@@ -28,7 +28,9 @@
   earlier attempts; a price key that the cost check does not cover makes
   the model `invalid`; a failed settle throws and is repeated from the
   body; 3 tries for the body save; a lease before a crashed attempt is
-  resumed; `max_price` stored with the attempt; 404 is `provider`; size
+  resumed (an interrupted body at a stop, a heartbeat each 10 s for a
+  crash); `max_price` stored with the attempt; `web_search`,
+  `image_output`, `image_token` and a negative `discount` are not covered; 404 is `provider`; size
   limits for the error body (64 KiB) and the stored text (1 MiB); deltas
   split on code points; `OPENROUTER_BASE_URL` must be `https` (or `http`
   for `localhost`).
