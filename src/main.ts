@@ -41,7 +41,16 @@ export const envSchema = commonEnv.omit({ SERVICE_NAME: true }).extend({
   NATS_USER: z.string().min(1),
   NATS_PASSWORD: z.string().min(1),
   OPENROUTER_API_KEY: z.string().min(1),
-  OPENROUTER_BASE_URL: z.url().default("https://openrouter.ai/api/v1"),
+  OPENROUTER_BASE_URL: z
+    .url()
+    .refine((value) => {
+      const url = new URL(value);
+      return (
+        url.protocol === "https:" ||
+        (url.protocol === "http:" && ["localhost", "127.0.0.1"].includes(url.hostname))
+      );
+    }, "Use https, or http only for localhost and 127.0.0.1")
+    .default("https://openrouter.ai/api/v1"),
   OPENROUTER_ZDR: z.enum(["true", "false"]).default("true"),
   OTEL_EXPORTER_OTLP_ENDPOINT: z.url().optional(),
   OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: z.url().optional(),

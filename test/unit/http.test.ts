@@ -80,4 +80,11 @@ test("the config has the defaults and needs the API key", () => {
   assert.equal(config.OPENROUTER_BASE_URL, "https://openrouter.ai/api/v1");
   assert.equal(config.OPENROUTER_ZDR, "true");
   assert.deepEqual(config.NATS_SERVERS, ["nats://a", "nats://b"]);
+  const base = (url: string) =>
+    envSchema.safeParse({ ...env, OPENROUTER_API_KEY: "k", OPENROUTER_BASE_URL: url }).success;
+  assert.equal(base("https://openrouter.example/api/v1"), true);
+  assert.equal(base("http://127.0.0.1:8090/api/v1"), true);
+  assert.equal(base("http://localhost:8090/api/v1"), true);
+  assert.equal(base("http://mock:8090/api/v1"), false);
+  assert.equal(base("ftp://localhost/api/v1"), false);
 });
