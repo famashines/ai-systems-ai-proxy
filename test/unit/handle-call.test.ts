@@ -207,6 +207,18 @@ test("a call reserves, streams deltas, stores the body, settles and completes", 
   assert.equal(world.marked.length, 1);
 });
 
+test("an empty output is still a completed call", async () => {
+  mock.reply("mock/small", streamOf("mock/small", []));
+  await world.handle(request());
+  const events = await world.events();
+  assert.deepEqual(
+    events.map((event) => event.type),
+    ["llm.CallStarted", "llm.CallCompleted"],
+  );
+  assert.equal(events[1]?.payload.text, "");
+  assert.equal(world.deltas.length, 0);
+});
+
 test("a retryable failure goes to the next model with a new attempt and a new reservation", async () => {
   mock.reply("mock/small", errorReply(429, "rate_limit_exceeded"));
   mock.reply("mock/large", streamOf("mock/large", ["Second"]));
