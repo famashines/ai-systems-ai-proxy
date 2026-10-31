@@ -309,6 +309,10 @@ test("a call streams deltas, books the cost and publishes the llm events", async
   assert.ok(body);
   assert.equal(JSON.stringify(body).includes(testKey), false);
   assert.equal(JSON.stringify(body).toLowerCase().includes("authorization"), false);
+  const attempt = await mongo.db
+    .collection<{ _id: string; heartbeatAt?: Date }>("attempts")
+    .findOne({ _id: `${callId}:1` });
+  assert.ok(attempt?.heartbeatAt instanceof Date);
   const received = mock.received.find((item) => item.body.model === "mock/small");
   assert.equal(received?.headers.authorization, `Bearer ${testKey}`);
 });

@@ -22,10 +22,12 @@ export interface Attempt {
   bodyId: string;
   amountMicroUsd: number;
   maxPrice: { prompt: number; completion: number; request: number };
+  heartbeatAt?: number;
 }
 
 export interface Attempts {
-  ensure(callId: string, attempt: number, init: Attempt): Promise<Attempt>;
+  ensure(callId: string, attempt: number, init: Omit<Attempt, "heartbeatAt">): Promise<Attempt>;
+  beat(callId: string, attempt: number): Promise<void>;
 }
 
 export interface CallBody {
@@ -49,11 +51,14 @@ export interface Catalog {
 }
 
 export function mongoAttempts(db: Db): Attempts {
-  const attempts = db.collection<Attempt & { _id: string; createdAt: Date }>("attempts");
+  const attempts = db.collection<
+    Omit<Attempt, "heartbeatAt"> & { _id: string; createdAt: Date; heartbeatAt?: Date }
+  >("attempts");
+  const key = (callId: string, attempt: number): string => `${callId}:${String(attempt)}`;
   return {
     async ensure(callId, attempt, init) {
       const doc = await attempts.findOneAndUpdate(
-        { _id: `${callId}:${String(attempt)}` },
+        { _id: key(callId, attempt) },
         { $setOnInsert: { ...init, createdAt: new Date() } },
         { upsert: true, returnDocument: "after" },
       );
@@ -63,7 +68,14 @@ export function mongoAttempts(db: Db): Attempts {
         bodyId: doc.bodyId,
         amountMicroUsd: doc.amountMicroUsd,
         maxPrice: doc.maxPrice,
+        ...(doc.heartbeatAt ? { heartbeatAt: doc.heartbeatAt.getTime() } : {}),
       };
+    },
+    async beat(callId, attempt) {
+      await attempts.updateOne(
+        { _id: key(callId, attempt) },
+        { $set: { heartbeatAt: new Date() } },
+      );
     },
   };
 }

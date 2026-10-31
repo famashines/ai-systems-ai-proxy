@@ -46,6 +46,7 @@ export interface Deps {
   now: () => number;
   stopping: AbortSignal;
   logger: Logger;
+  heartbeatMs?: number;
 }
 
 export type CallRequested = EventEnvelopeV1 & {
@@ -64,7 +65,8 @@ const stopped = (deps: Deps): boolean => deps.stopping.aborted;
 
 export const reserveMarginMs = 60_000;
 export const maxCallMs = 3_540_000;
-export const leaseMarginMs = 30_000;
+export const heartbeatMs = 10_000;
+export const heartbeatStaleMs = 30_000;
 const saveTries = 3;
 
 export async function handleCallRequested(
@@ -87,7 +89,9 @@ export async function handleCallRequested(
       0,
     );
   let spent = failedCost(past);
-  const startedAt = history.findLast((stored) => stored.type === "llm.CallStarted")?.occurredAt;
+  const startedAt = Date.parse(
+    history.findLast((stored) => stored.type === "llm.CallStarted")?.occurredAt ?? "",
+  );
 
   const append = async (events: CallEvent[]): Promise<void> => {
     const final = events.reduce(evolve, state).final;
@@ -232,22 +236,35 @@ export async function handleCallRequested(
     ]);
     let i = 0;
     const started = deps.now();
-    const { result, request, response } = await deps.provider.complete({
-      model,
-      messages: call.messages,
-      maxTokens: call.maxTokens,
-      maxPrice: stored.maxPrice,
-      signal: AbortSignal.any([AbortSignal.timeout(durationMs), deps.stopping]),
-      onDelta: (text) => {
-        for (const part of splitDelta(cleanText(text))) {
-          deps.publish(deltaSubject(call.taskId, call.callId), { attempt, i, text: part });
-          i += 1;
-        }
-      },
-    });
-    if (stopped(deps) && !result.ok) throw new StoppingError();
-    const outcome = outcomeOf(result, entry, stored.amountMicroUsd, deps.now() - started);
-    await saveBody({
+    const beat = (): void => {
+      deps.attempts.beat(call.callId, attempt).catch((error: unknown) => {
+        deps.logger.warn({ error: (error as Error).name }, "the attempt heartbeat failed");
+      });
+    };
+    beat();
+    const heartbeat = setInterval(beat, deps.heartbeatMs ?? heartbeatMs);
+    const { result, request, response } = await deps.provider
+      .complete({
+        model,
+        messages: call.messages,
+        maxTokens: call.maxTokens,
+        maxPrice: stored.maxPrice,
+        signal: AbortSignal.any([AbortSignal.timeout(durationMs), deps.stopping]),
+        onDelta: (text) => {
+          for (const part of splitDelta(cleanText(text))) {
+            deps.publish(deltaSubject(call.taskId, call.callId), { attempt, i, text: part });
+            i += 1;
+          }
+        },
+      })
+      .finally(() => {
+        clearInterval(heartbeat);
+      });
+    const stopping = stopped(deps) && !result.ok;
+    const outcome = stopping
+      ? interrupted(stored.amountMicroUsd)
+      : outcomeOf(result, entry, stored.amountMicroUsd, deps.now() - started);
+    const body = {
       _id: stored.bodyId,
       callId: call.callId,
       attempt,
@@ -256,7 +273,17 @@ export async function handleCallRequested(
       response: { ...response, text: cleanText(response.text) },
       outcome,
       createdAt: new Date(),
-    });
+    };
+    if (stopping) {
+      await saveBody(body).catch((error: unknown) => {
+        deps.logger.warn(
+          { error: (error as Error).name },
+          "the body of a stopped attempt was not saved",
+        );
+      });
+      throw new StoppingError();
+    }
+    await saveBody(body);
     return { entry: stored, outcome, stored: true };
   }
 
@@ -269,8 +296,7 @@ export async function handleCallRequested(
     });
     const outcome = await deps.bodies.outcome(entry.bodyId);
     if (outcome) return { entry, outcome, stored: true };
-    const leaseEnd = Date.parse(startedAt ?? "") + durationMs + leaseMarginMs;
-    const wait = leaseEnd - deps.now();
+    const wait = (entry.heartbeatAt ?? startedAt) + heartbeatStaleMs - deps.now();
     if (wait > 0) {
       try {
         await sleep(wait, undefined, { signal: deps.stopping });

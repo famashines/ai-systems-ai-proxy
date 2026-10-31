@@ -11,9 +11,10 @@ import { createLogger } from "@famashines/ai-systems-kit/observability";
 import { createMemoryEventStore, fakeIds } from "@famashines/ai-systems-kit/testing";
 import type { Attempt, CallBody } from "../../src/adapters/mongo.ts";
 import { openRouter, type LlmProvider } from "../../src/adapters/openrouter.ts";
+import { interrupted } from "../../src/domain/call.ts";
 import {
   handleCallRequested,
-  leaseMarginMs,
+  heartbeatStaleMs,
   StoppingError,
   type CallRequested,
   type Deps,
@@ -74,6 +75,7 @@ function setup(options: { provider?: LlmProvider } = {}) {
   const settles: SettleReservationRequestV1[] = [];
   const deltas: { subject: string; delta: DeltaV1 }[] = [];
   const marked: number[] = [];
+  const beats: number[] = [];
   const stop = new AbortController();
   const budget = {
     reply: (input: ReserveFundsRequestV1): Promise<ReserveFundsReplyV1> =>
@@ -93,6 +95,12 @@ function setup(options: { provider?: LlmProvider } = {}) {
         const key = `${id}:${String(attempt)}`;
         if (!attempts.has(key)) attempts.set(key, init);
         return Promise.resolve(attempts.get(key) as Attempt);
+      },
+      beat: (id, attempt) => {
+        const entry = attempts.get(`${id}:${String(attempt)}`);
+        if (entry) entry.heartbeatAt = Date.now();
+        beats.push(Date.now());
+        return Promise.resolve();
       },
     },
     bodies: {
@@ -154,6 +162,7 @@ function setup(options: { provider?: LlmProvider } = {}) {
     settles,
     deltas,
     marked,
+    beats,
     budget,
     catalog,
     stop,
@@ -428,7 +437,7 @@ test("a redelivery after a crash in the stream books the reserved amount and goe
   const deps = {
     ...crashing.deps,
     provider: world.deps.provider,
-    now: () => Date.now() + 60_000 + leaseMarginMs + 1000,
+    now: () => Date.now() + heartbeatStaleMs + 1000,
   };
   await handleCallRequested(deps, request(), {
     markProcessed: () => Promise.resolve(),
@@ -447,7 +456,7 @@ test("a redelivery after a crash in the stream books the reserved amount and goe
   assert.equal(mock.received.length, 1);
 });
 
-test("a stop during the call throws and appends no end event", async () => {
+test("a stop during the call saves an interrupted body, throws and appends no end event", async () => {
   mock.reply("mock/small", { kind: "hang" });
   const running = world.handle(request());
   setTimeout(() => {
@@ -458,7 +467,80 @@ test("a stop during the call throws and appends no end event", async () => {
     (await world.events()).map((event) => event.type),
     ["llm.CallStarted"],
   );
-  assert.equal(world.bodies.size, 0);
+  assert.deepEqual(
+    [...world.bodies.values()].map((body) => body.outcome),
+    [interrupted(world.reserves[0]?.amountMicroUsd ?? -1)],
+  );
+});
+
+test(
+  "R4: after a stop, the next delivery goes on at once, also with a long maxDurationMs",
+  { timeout: 10_000 },
+  async () => {
+    mock.reply("mock/small", { kind: "hang" });
+    const running = world.handle(request({ maxDurationMs: 600_000 }));
+    setTimeout(() => {
+      world.stop.abort();
+    }, 50);
+    await assert.rejects(running, StoppingError);
+    const again = new AbortController();
+    const started = Date.now();
+    await handleCallRequested(
+      { ...world.deps, stopping: again.signal },
+      request({ maxDurationMs: 600_000 }),
+      {
+        markProcessed: () => Promise.resolve(),
+      },
+    );
+    assert.ok(Date.now() - started < 2000);
+    const events = await world.events();
+    assert.deepEqual(
+      events.map((event) => event.type),
+      ["llm.CallStarted", "llm.CallFailed", "llm.CallStarted", "llm.CallCompleted"],
+    );
+    assert.equal(events[1]?.payload.costMicroUsd, world.reserves[0]?.amountMicroUsd);
+    assert.equal(typeof events[1]?.payload.bodyId, "string");
+  },
+);
+
+test(
+  "R4: after a crash, the next delivery waits only until the heartbeat is 30 s old",
+  { timeout: 10_000 },
+  async () => {
+    const crashing = setup({
+      provider: {
+        complete: () => Promise.reject(new Error("crash in the stream")),
+        models: () => Promise.resolve([]),
+      },
+    });
+    await assert.rejects(crashing.handle(request({ maxDurationMs: 600_000 })), /crash/);
+    assert.equal(crashing.beats.length, 1);
+    const deps = {
+      ...crashing.deps,
+      provider: world.deps.provider,
+      now: () => Date.now() + heartbeatStaleMs + 1000,
+    };
+    const started = Date.now();
+    await handleCallRequested(deps, request({ maxDurationMs: 600_000 }), {
+      markProcessed: () => Promise.resolve(),
+    });
+    assert.ok(Date.now() - started < 2000);
+    assert.deepEqual(
+      (await crashing.events()).map((event) => event.type),
+      ["llm.CallStarted", "llm.CallFailed", "llm.CallStarted", "llm.CallCompleted"],
+    );
+  },
+);
+
+test("the heartbeat is renewed while the call streams and stops after it", async () => {
+  world.deps.heartbeatMs = 50;
+  mock.reply("mock/small", { kind: "hang" });
+  mock.reply("mock/large", streamOf("mock/large", ["ok"]));
+  await world.handle(request({ maxDurationMs: 1000 }));
+  const count = world.beats.length;
+  assert.ok(count >= 15, String(count));
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  assert.equal(world.beats.length, count);
 });
 
 test("a call that runs past maxDurationMs is a timeout", async () => {
@@ -570,7 +652,7 @@ test("a body save that fails three times throws", async () => {
   );
 });
 
-test("a started attempt with no body waits for its lease before it is resumed", async () => {
+test("a started attempt with no body waits while its heartbeat is fresh", async () => {
   const crashing = setup({
     provider: {
       complete: () => Promise.reject(new Error("crash in the stream")),
@@ -578,11 +660,10 @@ test("a started attempt with no body waits for its lease before it is resumed", 
     },
   });
   await assert.rejects(crashing.handle(request()), /crash/);
-  const leaseMs = 60_000 + leaseMarginMs;
   const deps = {
     ...crashing.deps,
     provider: world.deps.provider,
-    now: () => Date.now() + leaseMs - 300,
+    now: () => Date.now() + heartbeatStaleMs - 300,
   };
   const started = Date.now();
   await handleCallRequested(deps, request(), { markProcessed: () => Promise.resolve() });
@@ -593,7 +674,7 @@ test("a started attempt with no body waits for its lease before it is resumed", 
   );
 });
 
-test("a stop during the lease wait throws", async () => {
+test("a stop during the heartbeat wait throws", async () => {
   const crashing = setup({
     provider: {
       complete: () => Promise.reject(new Error("crash in the stream")),
