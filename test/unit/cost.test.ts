@@ -127,7 +127,6 @@ test("a price key that the worst case does not cover is found, also in overrides
       prompt: "0.1",
       completion: "0.1",
       image: "0.01",
-      web_search: "0.02",
       discount: 0.1,
       new_fee: "0",
       overrides: [{ min_prompt_tokens: 200000, utc_days: [1], prompt: "0.2" }],
@@ -135,6 +134,12 @@ test("a price key that the worst case does not cover is found, also in overrides
     undefined,
   );
   assert.equal(uncoveredPrice({ prompt: "0", completion: "0", new_fee: "0.001" }), "new_fee");
+  for (const key of ["web_search", "image_output", "image_token"]) {
+    assert.equal(uncoveredPrice({ prompt: "0", completion: "0", [key]: "0.01" }), key);
+    assert.equal(uncoveredPrice({ prompt: "0", completion: "0", [key]: "0" }), undefined);
+  }
+  assert.equal(uncoveredPrice({ prompt: "0", completion: "0", discount: -0.2 }), "discount");
+  assert.equal(uncoveredPrice({ prompt: "0", completion: "0", discount: 0 }), undefined);
   assert.equal(
     uncoveredPrice({ prompt: "0", completion: "0", overrides: [{ other_fee: "1" }] }),
     "other_fee",

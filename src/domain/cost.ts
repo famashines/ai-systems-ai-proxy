@@ -42,13 +42,9 @@ type PriceKey = (typeof priceKeys)[number];
 
 const notCharged = new Set([
   "image",
-  "image_token",
-  "image_output",
   "audio",
   "audio_output",
   "input_audio_cache",
-  "web_search",
-  "discount",
   "overrides",
   "min_prompt_tokens",
   "utc_start",
@@ -77,7 +73,11 @@ export function uncoveredPrice(pricing: Pricing): string | undefined {
   const known: readonly string[] = priceKeys;
   return [pricing, ...(pricing.overrides ?? [])]
     .flatMap((entry) => Object.entries(entry))
-    .find(([key, value]) => !known.includes(key) && !notCharged.has(key) && charged(value))?.[0];
+    .find(([key, value]) =>
+      key === "discount"
+        ? Number(value) < 0
+        : !known.includes(key) && !notCharged.has(key) && charged(value),
+    )?.[0];
 }
 
 export function prices(pricing: Pricing): Record<PriceKey, bigint> {
