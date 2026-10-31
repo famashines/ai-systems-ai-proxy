@@ -13,6 +13,7 @@ import type { Attempt, CallBody } from "../../src/adapters/mongo.ts";
 import { openRouter, type LlmProvider } from "../../src/adapters/openrouter.ts";
 import {
   handleCallRequested,
+  leaseMarginMs,
   StoppingError,
   type CallRequested,
   type Deps,
@@ -21,6 +22,7 @@ import type { CatalogModel } from "../../src/domain/cost.ts";
 import {
   errorReply,
   startMockOpenRouter,
+  streamError,
   streamOf,
   type MockOpenRouter,
 } from "../mock-openrouter.ts";
@@ -36,6 +38,15 @@ const catalogModels: Record<string, CatalogModel> = {
     id: "mock/large",
     contextLength: 128000,
     pricing: { prompt: "0.0000025", completion: "0.00001" },
+  },
+  "mock/small-b": { id: "mock/small-b", pricing: { prompt: "0.000001", completion: "0.000002" } },
+  "mock/new-fee": {
+    id: "mock/new-fee",
+    pricing: { prompt: "0.000001", completion: "0.000002", new_fee: "0.01" },
+  },
+  "mock/vision": {
+    id: "mock/vision",
+    pricing: { prompt: "0.000001", completion: "0.000002", image: "0.001" },
   },
 };
 
@@ -71,7 +82,8 @@ function setup(options: { provider?: LlmProvider } = {}) {
         reservationId: input.reservationId,
         expiresAt: "2026-10-31T12:00:00.000Z",
       }),
-    settleFails: false,
+    settleFails: 0,
+    saveFails: 0,
   };
   const catalog = { state: "ready" as "ready" | "unavailable" };
   const deps: Deps = {
@@ -85,6 +97,10 @@ function setup(options: { provider?: LlmProvider } = {}) {
     },
     bodies: {
       save: (body) => {
+        if (budget.saveFails > 0) {
+          budget.saveFails -= 1;
+          return Promise.reject(new Error("MongoDB write failed"));
+        }
         bodies.set(body._id, body);
         return Promise.resolve();
       },
@@ -103,7 +119,10 @@ function setup(options: { provider?: LlmProvider } = {}) {
       },
       settle: (input) => {
         settles.push(input);
-        if (budget.settleFails) return Promise.reject(new UnavailableError("no answer"));
+        if (budget.settleFails > 0) {
+          budget.settleFails -= 1;
+          return Promise.reject(new UnavailableError("no answer"));
+        }
         return Promise.resolve({
           state: "settled",
           reservationId: input.reservationId,
@@ -303,13 +322,26 @@ test("a budget refusal gives budget_refused and no provider call", async () => {
   assert.equal(world.marked.length, 1);
 });
 
-test("no budget answer fails closed with budget_refused and no provider call", async () => {
+test("no budget answer fails closed, frees the reservation with a settle of 0, and calls no provider", async () => {
   world.budget.reply = () => Promise.reject(new UnavailableError("rpc.budget.reserve"));
   await world.handle(request());
   const events = await world.events();
   assert.equal(events.length, 1);
-  assert.equal((events[0]?.payload as Record<string, unknown>).errorClass, "budget_refused");
+  assert.equal(events[0]?.payload.errorClass, "budget_refused");
   assert.equal(mock.received.length, 0);
+  assert.deepEqual(world.settles, [
+    { reservationId: world.reserves[0]?.reservationId, actualMicroUsd: 0 },
+  ]);
+});
+
+test("no budget answer and a failed settle of 0 still end the call with budget_refused", async () => {
+  world.budget.reply = () => Promise.reject(new UnavailableError("rpc.budget.reserve"));
+  world.budget.settleFails = 1;
+  await world.handle(request());
+  const events = await world.events();
+  assert.equal(events[0]?.payload.errorClass, "budget_refused");
+  assert.equal(world.settles.length, 1);
+  assert.equal(world.marked.length, 1);
 });
 
 test("a worst case above maxCostMicroUsd is refused before the reservation", async () => {
@@ -318,7 +350,7 @@ test("a worst case above maxCostMicroUsd is refused before the reservation", asy
   assert.equal(events.length, 1);
   const failed = events[0]?.payload as Record<string, unknown>;
   assert.equal(failed.errorClass, "budget_refused");
-  assert.match(failed.reason as string, /above the call limit of 10 micro-USD/);
+  assert.match(failed.reason as string, /above the rest of the call limit: 10 of 10 micro-USD/);
   assert.equal(world.reserves.length, 0);
   assert.equal(mock.received.length, 0);
 });
@@ -393,7 +425,11 @@ test("a redelivery after a crash in the stream books the reserved amount and goe
     },
   });
   await assert.rejects(crashing.handle(request()), /crash/);
-  const deps = { ...crashing.deps, provider: world.deps.provider };
+  const deps = {
+    ...crashing.deps,
+    provider: world.deps.provider,
+    now: () => Date.now() + 60_000 + leaseMarginMs + 1000,
+  };
   await handleCallRequested(deps, request(), {
     markProcessed: () => Promise.resolve(),
   });
@@ -436,11 +472,163 @@ test("a call that runs past maxDurationMs is a timeout", async () => {
   );
 });
 
-test("a failed settle does not stop the call", async () => {
-  world.budget.settleFails = true;
+test("a failed settle throws before the end event; the next delivery settles again from the body", async () => {
+  world.budget.settleFails = 1;
+  await assert.rejects(world.handle(request()), UnavailableError);
+  assert.deepEqual(
+    (await world.events()).map((event) => event.type),
+    ["llm.CallStarted"],
+  );
   await world.handle(request());
   assert.deepEqual(
     (await world.events()).map((event) => event.type),
     ["llm.CallStarted", "llm.CallCompleted"],
   );
+  assert.equal(world.settles.length, 2);
+  assert.deepEqual(world.settles[0], world.settles[1]);
+  assert.equal(mock.received.length, 1);
+});
+
+test("a stopping service starts no call", async () => {
+  let lookups = 0;
+  const { catalog } = world.deps;
+  world.deps.catalog = {
+    model: (id) => {
+      lookups += 1;
+      return catalog.model(id);
+    },
+  };
+  world.stop.abort();
+  await assert.rejects(world.handle(request()), StoppingError);
+  assert.equal(lookups, 0);
+  assert.equal(world.reserves.length, 0);
+  assert.deepEqual(await world.events(), []);
+});
+
+test("a stop before the reservation makes no reservation", async () => {
+  const { catalog } = world.deps;
+  world.deps.catalog = {
+    model: (id) => {
+      world.stop.abort();
+      return catalog.model(id);
+    },
+  };
+  await assert.rejects(world.handle(request()), StoppingError);
+  assert.equal(world.reserves.length, 0);
+  assert.equal(mock.received.length, 0);
+});
+
+test("maxCostMicroUsd counts the cost of the earlier attempts of the call", async () => {
+  mock.reply("mock/small", streamError("mock/small", [], { code: 502, message: "down" }));
+  await world.handle(request({ models: ["mock/small", "mock/small-b"], maxCostMicroUsd: 400 }));
+  const events = await world.events();
+  assert.deepEqual(
+    events.map((event) => [event.type, event.payload.errorClass]),
+    [
+      ["llm.CallStarted", undefined],
+      ["llm.CallFailed", "provider"],
+      ["llm.CallFailed", "budget_refused"],
+    ],
+  );
+  assert.equal(events[1]?.payload.costMicroUsd, 288);
+  assert.match(events[2]?.payload.reason as string, /112 of 400 micro-USD/);
+  assert.equal(world.reserves.length, 1);
+  assert.equal(mock.received.length, 1);
+});
+
+test("a price that the cost check does not cover makes the model invalid", async () => {
+  await world.handle(request({ models: ["mock/new-fee", "mock/small"] }));
+  const events = await world.events();
+  assert.equal(events.length, 1);
+  assert.equal(events[0]?.payload.errorClass, "invalid");
+  assert.equal(
+    events[0].payload.reason,
+    "The model has a price for new_fee that the cost check does not cover",
+  );
+  assert.equal(world.reserves.length, 0);
+  world = setup();
+  await world.handle(request({ models: ["mock/vision"] }));
+  assert.equal((await world.events()).at(-1)?.type, "llm.CallCompleted");
+});
+
+test("a failed body save is tried again before the call goes on", async () => {
+  world.budget.saveFails = 2;
+  await world.handle(request());
+  assert.deepEqual(
+    (await world.events()).map((event) => event.type),
+    ["llm.CallStarted", "llm.CallCompleted"],
+  );
+  assert.equal(mock.received.length, 1);
+});
+
+test("a body save that fails three times throws", async () => {
+  world.budget.saveFails = 3;
+  await assert.rejects(world.handle(request()), /MongoDB write failed/);
+  assert.deepEqual(
+    (await world.events()).map((event) => event.type),
+    ["llm.CallStarted"],
+  );
+});
+
+test("a started attempt with no body waits for its lease before it is resumed", async () => {
+  const crashing = setup({
+    provider: {
+      complete: () => Promise.reject(new Error("crash in the stream")),
+      models: () => Promise.resolve([]),
+    },
+  });
+  await assert.rejects(crashing.handle(request()), /crash/);
+  const leaseMs = 60_000 + leaseMarginMs;
+  const deps = {
+    ...crashing.deps,
+    provider: world.deps.provider,
+    now: () => Date.now() + leaseMs - 300,
+  };
+  const started = Date.now();
+  await handleCallRequested(deps, request(), { markProcessed: () => Promise.resolve() });
+  assert.ok(Date.now() - started >= 250);
+  assert.deepEqual(
+    (await crashing.events()).map((event) => event.type),
+    ["llm.CallStarted", "llm.CallFailed", "llm.CallStarted", "llm.CallCompleted"],
+  );
+});
+
+test("a stop during the lease wait throws", async () => {
+  const crashing = setup({
+    provider: {
+      complete: () => Promise.reject(new Error("crash in the stream")),
+      models: () => Promise.resolve([]),
+    },
+  });
+  await assert.rejects(crashing.handle(request()), /crash/);
+  const waiting = crashing.handle(request());
+  setTimeout(() => {
+    crashing.stop.abort();
+  }, 50);
+  await assert.rejects(waiting, StoppingError);
+  assert.deepEqual(
+    (await crashing.events()).map((event) => event.type),
+    ["llm.CallStarted"],
+  );
+});
+
+test("a redelivery uses the stored max_price, not a new catalog price", async () => {
+  const store = world.deps.store;
+  world.deps.store = { ...store, append: () => Promise.reject(new Error("crash")) };
+  await assert.rejects(world.handle(request()), /crash/);
+  world.deps.store = store;
+  const small = catalogModels["mock/small"];
+  assert.ok(small);
+  const old = small.pricing;
+  small.pricing = { prompt: "0.000009", completion: "0.000009" };
+  try {
+    await world.handle(request());
+  } finally {
+    small.pricing = old;
+  }
+  assert.deepEqual((mock.received[0]?.body.provider as { max_price: unknown }).max_price, {
+    prompt: 1,
+    completion: 2,
+    request: 0,
+  });
 });

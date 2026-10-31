@@ -21,6 +21,7 @@ export interface Attempt {
   reservationId: string;
   bodyId: string;
   amountMicroUsd: number;
+  maxPrice: { prompt: number; completion: number; request: number };
 }
 
 export interface Attempts {
@@ -61,6 +62,7 @@ export function mongoAttempts(db: Db): Attempts {
         reservationId: doc.reservationId,
         bodyId: doc.bodyId,
         amountMicroUsd: doc.amountMicroUsd,
+        maxPrice: doc.maxPrice,
       };
     },
   };
