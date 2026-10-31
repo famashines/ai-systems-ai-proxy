@@ -26,41 +26,45 @@ ADR 0014, 0015, 0019, 0023, 0025, `research/openrouter.md`). Contracts:
 
 ## One call
 
-| Step        | Rule                                                                                                                                                                                                                                                                                                                                                                                         |
-| ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Catalog     | The price of the model comes from the catalog cache. A model that is not in the catalog gives `CallFailed` `invalid`. No catalog at all (never fetched) gives `provider`. Both end the call.                                                                                                                                                                                                 |
-| Worst case  | `request + input bound x max(prompt, input_cache_write, input_cache_write_1h) + (maxTokens + 5%) x max(completion, internal_reasoning)`, each price the highest of the base price and all `pricing.overrides`. The input bound is the UTF-8 bytes of the messages plus 16 for each message and 16 more, at most the context length. Exact integer math in atto-USD, rounded up to micro-USD. |
-| Call limit  | When `maxCostMicroUsd` is set and the worst case is above it: `CallFailed` `budget_refused`, no reservation, no provider call.                                                                                                                                                                                                                                                               |
-| Reservation | The `reservationId`, the `bodyId` and the amount of each (`callId`, `attempt`) are stored in `attempts` before the reserve. A redelivery uses the same values, so the reserve is idempotent. `ttlMs` is `maxDurationMs` plus 60 s, at most 1 hour.                                                                                                                                           |
-| Refusal     | A refusal, an error or no answer in 2 s gives `CallFailed` `budget_refused` (fail closed, ADR 0015). No provider call.                                                                                                                                                                                                                                                                       |
-| Start       | `llm.CallStarted` is appended with the expected version before the provider call, so only one runner calls the provider for an attempt.                                                                                                                                                                                                                                                      |
-| Call        | One model for each attempt. The call stops after `maxDurationMs` (`timeout`).                                                                                                                                                                                                                                                                                                                |
-| Deltas      | Core NATS `delta.<taskId>.<callId>`, body `{ attempt, i, text }`. `i` starts at 0 for each attempt. NUL is removed. A text above 16,384 characters is split.                                                                                                                                                                                                                                 |
-| Body        | The request body and the response (text, finish reason, usage, error, generation id, status) are stored in `call_bodies` with the outcome, before the settle. No headers, so no API key. Kept 90 days.                                                                                                                                                                                       |
-| Settle      | The real cost. A settle that fails is logged; the reservation then expires and the budget books the full amount.                                                                                                                                                                                                                                                                             |
-| End         | `CallCompleted` (also with empty text; orchestration makes `RunFailed` `empty_output`), or `CallFailed`. The last event and the `processed` marker are in one transaction.                                                                                                                                                                                                                   |
+A stopping pod starts no new call: the handler checks the stop at its
+start and again before the reserve.
+
+| Step        | Rule                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Catalog     | The price of the model comes from the catalog cache. A model that is not in the catalog gives `CallFailed` `invalid`. No catalog at all (never fetched) gives `provider`. Both end the call.                                                                                                                                                                                                                                                                                     |
+| Price keys  | A model with a price above 0 for a key that the worst case does not cover gives `CallFailed` `invalid` and ends the call. Covered: `prompt`, `completion`, `request`, `internal_reasoning`, `input_cache_write`, `input_cache_write_1h`, `input_cache_read`. Not charged, because a request has only text, no plugins and no tools: `image`, `image_token`, `image_output`, `audio`, `audio_output`, `input_audio_cache`, `web_search`, `discount`, and the override conditions. |
+| Worst case  | `request + input bound x max(prompt, input_cache_write, input_cache_write_1h, input_cache_read) + output bound x max(completion, internal_reasoning)`, each price the highest of the base price and all `pricing.overrides`. The input bound is the UTF-8 bytes of the messages plus 16 for each message and 16 more, at most the context length. The output bound is `max(maxTokens, 16)` plus 5%. Exact integer math in atto-USD, rounded up to micro-USD.                     |
+| Call limit  | When `maxCostMicroUsd` is set (the rest of the task allowance), the limit for an attempt is that value minus the cost booked by the earlier attempts of this call. A worst case above it gives `CallFailed` `budget_refused`, no reservation, no provider call.                                                                                                                                                                                                                  |
+| Reservation | The `reservationId`, the `bodyId`, the amount and the `max_price` of each (`callId`, `attempt`) are stored in `attempts` before the reserve. A redelivery uses the same values (no new catalog price), so the reserve is idempotent. The call time is `maxDurationMs`, at most 3,540,000 ms; `ttlMs` is the call time plus 60 s.                                                                                                                                                 |
+| Refusal     | A refusal gives `CallFailed` `budget_refused`. An error or no answer in 2 s also gives `budget_refused` (fail closed, ADR 0015), after a settle of 0 with the same `reservationId` that frees a hold that the budget made with no answer. If that settle fails, it is logged, and the budget books the hold in full when it expires. No provider call.                                                                                                                           |
+| Start       | `llm.CallStarted` is appended with the expected version before the provider call, so only one runner calls the provider for an attempt.                                                                                                                                                                                                                                                                                                                                          |
+| Call        | One model for each attempt. The call stops after the call time (`timeout`).                                                                                                                                                                                                                                                                                                                                                                                                      |
+| Deltas      | Core NATS `delta.<taskId>.<callId>`, body `{ attempt, i, text }`. `i` starts at 0 for each attempt. NUL is removed. A text above 16,384 characters is split on a code point boundary.                                                                                                                                                                                                                                                                                            |
+| Body        | The request body and the response (text, finish reason, usage, error, generation id, status) are stored in `call_bodies` with the outcome, before the settle. No headers, so no API key. The error body is read up to 64 KiB. The stored text stops at 1 MiB with `truncated: true`. A failed save is tried 3 times, then the handler throws. Kept 90 days.                                                                                                                      |
+| Settle      | The real cost. A settle that fails throws before the end event. The next delivery takes the outcome from the body and settles again; `already_settled` makes this safe.                                                                                                                                                                                                                                                                                                          |
+| End         | `CallCompleted` (also with empty text; orchestration makes `RunFailed` `empty_output`), or `CallFailed`. The last event and the `processed` marker are in one transaction.                                                                                                                                                                                                                                                                                                       |
 
 Cost of an attempt:
 
-| Case                                            | Cost                                                                  |
-| ----------------------------------------------- | --------------------------------------------------------------------- |
-| `usage.cost` is in the stream                   | `Math.round(cost x 1,000,000)`                                        |
-| usage with no cost                              | tokens x catalog prices (input and output rates as in the worst case) |
-| no usage, the response was committed (HTTP 200) | the reserved amount (the real cost is not known)                      |
-| no usage, an HTTP error before the stream       | 0                                                                     |
+| Case                                                                                      | Cost                                                                                    |
+| ----------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| `usage.cost` is in the stream                                                             | `Math.round(cost x 1,000,000)`                                                          |
+| usage with no cost                                                                        | tokens x catalog prices (input and output rates as in the worst case)                   |
+| no usage, the request was sent (HTTP 200, a timeout or a socket error after the request)  | the reserved amount (the real cost is not known; some providers bill the full response) |
+| no usage, an HTTP error status, or a connect error before the request (refused, DNS, TLS) | 0                                                                                       |
 
 `CallCompleted.text` has no NUL and at most 100,000 characters. The full
 text is in the call body.
 
 ## Error classes
 
-| Class            | From                                                                                                                                          | Next model |
-| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
-| `rate_limit`     | 429, `rate_limit_exceeded`, 402 with `limit_source` `openrouter_in_flight_budget`                                                             | yes        |
-| `timeout`        | 408, 504, 524, `timeout`, no end in `maxDurationMs`                                                                                           | yes        |
-| `provider`       | 5xx, 529, `provider_unavailable`, `provider_overloaded`, `server`, a network error, a bad chunk, a stream with no end, a crash in the attempt | yes        |
-| `invalid`        | other 4xx (400, 401, 403, 404, 413, 422 ...), a model that is not in the catalog                                                              | no         |
-| `budget_refused` | budget refusal or no answer, the call limit, 402 (credits, key limit), 403 with a `limit_source`                                              | no         |
+| Class            | From                                                                                                                                                                                                                          | Next model |
+| ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
+| `rate_limit`     | 429, `rate_limit_exceeded`, 402 with `limit_source` `openrouter_in_flight_budget`                                                                                                                                             | yes        |
+| `timeout`        | 408, 504, 524, `timeout`, no end in the call time                                                                                                                                                                             | yes        |
+| `provider`       | 404 (also "no endpoint" for the `zdr`, `data_collection` or `max_price` rules), 5xx, 529, `provider_unavailable`, `provider_overloaded`, `server`, a network error, a bad chunk, a stream with no end, a crash in the attempt | yes        |
+| `invalid`        | other 4xx (400, 401, 403, 413, 422 ...), a model that is not in the catalog, a price key that is not covered                                                                                                                  | no         |
+| `budget_refused` | budget refusal or no answer, the call limit, 402 (credits, key limit), 403 with a `limit_source`                                                                                                                              | no         |
 
 The `error.metadata.error_type` wins over the HTTP status. A mid-stream
 error (HTTP 200, `finish_reason: "error"`) uses `error.code` (a number or a
@@ -74,11 +78,19 @@ fallback chain runs inside one try.
 
 ```
 redelivery of CallRequested
-  last event is final                        --> nothing
-  attempt n started, body stored             --> outcome from the body, settle, end event; no provider call
-  attempt n started, no body (crash in call) --> CallFailed provider, cost = reserved amount, next model
-  attempt n not started                      --> same reservationId and amount, reserve again
+  last event is final                         --> nothing
+  attempt n started, body stored              --> outcome from the body, settle, end event; no provider call
+  attempt n started, no body, lease running   --> wait until the lease ends, then read the stream again
+  attempt n started, no body, lease ended     --> CallFailed provider, cost = reserved amount, next model
+  attempt n not started                       --> same reservationId, amount and max_price, reserve again
+lease end = CallStarted time + call time + 30 s
 ```
+
+The kit consumer has no nak with a chosen delay, and 5 deliveries with its
+backoff last about 2.5 minutes, which is shorter than a lease. So the
+handler waits for the lease itself. The kit keeps the message in progress
+while it waits. A stop during the wait throws, and the message comes
+again.
 
 ## OpenRouter facts used (read 2026-10-31)
 
@@ -119,18 +131,18 @@ From `ai-systems-docs/research/openrouter.md` (M2-01), which has the sources:
 
 Environment variables (`.env.example` has all of them):
 
-| Variable                                                            | Default                        | Content                                                           |
-| ------------------------------------------------------------------- | ------------------------------ | ----------------------------------------------------------------- |
-| `MONGODB_URI`                                                       | required                       | MongoDB connection string (replica set)                           |
-| `MONGODB_DATABASE`                                                  | `ai_proxy`                     | Database name                                                     |
-| `NATS_SERVERS`                                                      | required                       | NATS URLs, comma-separated                                        |
-| `NATS_USER`                                                         | required                       | `ai-systems-ai-proxy` on the cluster                              |
-| `NATS_PASSWORD`                                                     | required                       | From the SealedSecret                                             |
-| `OPENROUTER_API_KEY`                                                | required                       | Secret `ai-systems-ai-proxy-openrouter`, key `OPENROUTER_API_KEY` |
-| `OPENROUTER_BASE_URL`                                               | `https://openrouter.ai/api/v1` | The mock server in tests and in the local system                  |
-| `OPENROUTER_ZDR`                                                    | `true`                         | `provider.zdr` on each request (`true` or `false`)                |
-| `PORT`, `LOG_LEVEL`, `RELEASE`                                      | `8080`, `info`, `local`        | As in the kit                                                     |
-| `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | not set                        | Traces go over OTLP only when one is set                          |
+| Variable                                                            | Default                        | Content                                                              |
+| ------------------------------------------------------------------- | ------------------------------ | -------------------------------------------------------------------- |
+| `MONGODB_URI`                                                       | required                       | MongoDB connection string (replica set)                              |
+| `MONGODB_DATABASE`                                                  | `ai_proxy`                     | Database name                                                        |
+| `NATS_SERVERS`                                                      | required                       | NATS URLs, comma-separated                                           |
+| `NATS_USER`                                                         | required                       | `ai-systems-ai-proxy` on the cluster                                 |
+| `NATS_PASSWORD`                                                     | required                       | From the SealedSecret                                                |
+| `OPENROUTER_API_KEY`                                                | required                       | Secret `ai-systems-ai-proxy-openrouter`, key `OPENROUTER_API_KEY`    |
+| `OPENROUTER_BASE_URL`                                               | `https://openrouter.ai/api/v1` | `https` only; `http` only for `localhost` and `127.0.0.1` (the mock) |
+| `OPENROUTER_ZDR`                                                    | `true`                         | `provider.zdr` on each request (`true` or `false`)                   |
+| `PORT`, `LOG_LEVEL`, `RELEASE`                                      | `8080`, `info`, `local`        | As in the kit                                                        |
+| `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | not set                        | Traces go over OTLP only when one is set                             |
 
 The kit service name is `ai-proxy`: the NATS inbox prefix is
 `_INBOX_ai-proxy` and the durable consumer is `ai-proxy` on `ORCHESTRATION`
@@ -144,7 +156,7 @@ models API and SSE streams with comment lines, small TCP pieces, the usage
 chunk, mid-stream errors, HTTP errors and calls that hang. Tests script it
 for each model. `npm run mock:openrouter` starts it on port 8090 (env
 `PORT`); with no script it streams "Mock answer." Set
-`OPENROUTER_BASE_URL=http://<host>:8090/api/v1`. No test calls the real
+`OPENROUTER_BASE_URL=http://127.0.0.1:8090/api/v1`. No test calls the real
 OpenRouter.
 
 ## Known limits
@@ -162,7 +174,20 @@ OpenRouter.
   most one try each minute after a failure). A stale price is safe because
   `provider.max_price` refuses a more expensive endpoint.
 - During a shutdown, a running provider call is stopped and the message
-  comes again; the attempt is then booked at the reserved amount.
+  comes again; after the lease the attempt is booked at the reserved
+  amount.
+- A crashed attempt is resumed only after its lease, so a redelivery
+  after a crash waits up to the call time plus 30 s.
+- A settle that fails 5 times (budget down for about 2.5 minutes) sends
+  the message to the DLQ. The body and the reservation stay; a DLQ replay
+  finishes the call with no provider call.
+- `provider.max_price` is a float in USD for each million tokens. A price
+  that is not exact in binary can give a value a little below the
+  endpoint price, and then OpenRouter has no endpoint (404, `provider`).
+  Check this in the M2-09 smoke test.
+- `OPENROUTER_BASE_URL` accepts `http` only for `localhost` and
+  `127.0.0.1`. A mock in another container (for example `http://mock:8090`
+  in the kit compose system) needs `https` or a change of this rule.
 
 ## Commands
 

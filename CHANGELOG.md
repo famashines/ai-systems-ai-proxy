@@ -22,3 +22,13 @@
 - Replay API `GET /internal/events`, `/health`, `/ready`, `/metrics`.
 - Mock OpenRouter server for tests and the local system.
 - Container image, CI and release workflow from the orchestration template.
+- Review fixes: no new call while the pod stops; a sent request counts as
+  committed (the reserved amount is booked when no usage comes); a settle
+  of 0 after a reserve with no answer; `maxCostMicroUsd` minus the cost of
+  earlier attempts; a price key that the cost check does not cover makes
+  the model `invalid`; a failed settle throws and is repeated from the
+  body; 3 tries for the body save; a lease before a crashed attempt is
+  resumed; `max_price` stored with the attempt; 404 is `provider`; size
+  limits for the error body (64 KiB) and the stored text (1 MiB); deltas
+  split on code points; `OPENROUTER_BASE_URL` must be `https` (or `http`
+  for `localhost`).
