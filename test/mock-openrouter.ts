@@ -2,9 +2,10 @@ import { createServer, type IncomingHttpHeaders, type ServerResponse } from "nod
 import type { AddressInfo } from "node:net";
 
 export type Reply =
-  | { kind: "stream"; events: (object | string)[]; endWithoutDone?: boolean }
+  | { kind: "stream"; events: (object | string)[]; hold?: boolean }
   | { kind: "json"; status: number; body: unknown; headers?: Record<string, string> }
-  | { kind: "hang" };
+  | { kind: "hang" }
+  | { kind: "reset" };
 
 export interface Received {
   headers: IncomingHttpHeaders;
@@ -106,6 +107,10 @@ export const defaultModels: unknown[] = [
 
 async function send(response: ServerResponse, reply: Reply): Promise<void> {
   if (reply.kind === "hang") return;
+  if (reply.kind === "reset") {
+    response.socket?.destroy();
+    return;
+  }
   if (reply.kind === "json") {
     response.writeHead(reply.status, { "content-type": "application/json", ...reply.headers });
     response.end(JSON.stringify(reply.body));
@@ -121,11 +126,12 @@ async function send(response: ServerResponse, reply: Reply): Promise<void> {
         : `data: ${JSON.stringify(event)}\n\n`,
     )
     .join("");
-  for (let start = 0; start < text.length; start += 7) {
-    response.write(text.slice(start, start + 7));
+  const size = text.length > 65_536 ? 65_536 : 7;
+  for (let start = 0; start < text.length; start += size) {
+    response.write(text.slice(start, start + size));
     await new Promise((resolve) => setImmediate(resolve));
   }
-  response.end();
+  if (!reply.hold) response.end();
 }
 
 export async function startMockOpenRouter(port = 0): Promise<MockOpenRouter> {

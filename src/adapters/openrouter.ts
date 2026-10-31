@@ -19,6 +19,7 @@ export interface ProviderResponse {
   finishReason?: string;
   usage?: Usage;
   error?: unknown;
+  truncated?: boolean;
 }
 
 export interface ProviderCall {
@@ -43,7 +44,7 @@ const ErrorBody = z.object({
   code: z.union([z.number(), z.string()]).optional(),
   message: z.string().optional(),
   metadata: z
-    .object({ error_type: z.string().optional(), limit_source: z.string().optional() })
+    .object({ error_type: z.string().nullish(), limit_source: z.string().nullish() })
     .nullish(),
 });
 type ErrorBody = z.infer<typeof ErrorBody>;
@@ -87,8 +88,8 @@ const errorTypes: Readonly<Record<string, LlmErrorClass>> = {
 };
 
 export function classify(status: number | undefined, error: ErrorBody | undefined): LlmErrorClass {
-  const type = error?.metadata?.error_type;
-  const limitSource = error?.metadata?.limit_source;
+  const type = error?.metadata?.error_type ?? undefined;
+  const limitSource = error?.metadata?.limit_source ?? undefined;
   if (limitSource === "openrouter_in_flight_budget") return "rate_limit";
   if (status === 402 || limitSource !== undefined || type === "payment_required") {
     return "budget_refused";
@@ -97,12 +98,13 @@ export function classify(status: number | undefined, error: ErrorBody | undefine
   if (known) return known;
   if (status === 429) return "rate_limit";
   if (status === 408 || status === 504 || status === 524) return "timeout";
+  if (status === 404) return "provider";
   if (status !== undefined && status >= 400 && status < 500) return "invalid";
   return "provider";
 }
 
-const label = (value: string | undefined): string =>
-  value !== undefined && /^[a-z0-9_]{1,64}$/.test(value) ? ` ${value}` : "";
+const label = (value: string | null | undefined): string =>
+  value != null && /^[a-z0-9_]{1,64}$/.test(value) ? ` ${value}` : "";
 
 export function failure(
   where: string,
@@ -134,6 +136,46 @@ const parseJson = (text: string): unknown => {
     return undefined;
   }
 };
+
+export const maxErrorBytes = 64 * 1024;
+export const maxStoredTextBytes = 1024 * 1024;
+
+const connectCodes = new Set([
+  "ECONNREFUSED",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "DEPTH_ZERO_SELF_SIGNED_CERT",
+  "SELF_SIGNED_CERT_IN_CHAIN",
+  "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+  "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+]);
+
+export function beforeRequest(error: unknown): boolean {
+  const code = (error as { cause?: { code?: unknown } } | undefined)?.cause?.code;
+  return (
+    typeof code === "string" &&
+    (connectCodes.has(code) || code.startsWith("ERR_TLS_") || code.startsWith("CERT_"))
+  );
+}
+
+async function capped(body: ReadableStream<Uint8Array> | null, max: number): Promise<string> {
+  if (!body) return "";
+  const parts: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for await (const piece of body) {
+      parts.push(piece);
+      size += piece.length;
+      if (size >= max) break;
+    }
+  } catch {
+    return "";
+  }
+  return new TextDecoder().decode(Buffer.concat(parts).subarray(0, max));
+}
 
 async function* lines(body: ReadableStream<Uint8Array>): AsyncGenerator<string> {
   const decoder = new TextDecoder();
@@ -188,19 +230,20 @@ export function openRouter(options: OpenRouterOptions): LlmProvider {
         body: JSON.stringify(request),
         signal: input.signal,
       });
-    } catch {
-      return done(aborted(input.signal, false, response));
+    } catch (error) {
+      return done(aborted(input.signal, !beforeRequest(error), response));
     }
     response.status = http.status;
     const generationId = http.headers.get("x-generation-id");
     if (generationId) response.generationId = generationId;
     if (!http.ok || !http.body) {
-      const text = await http.text().catch(() => "");
+      const text = await capped(http.body, maxErrorBytes);
       const parsed = z.object({ error: ErrorBody }).safeParse(parseJson(text));
       return fail("error", parsed.success ? parsed.data.error : undefined, false);
     }
     let ended = false;
     let error: ErrorBody | undefined;
+    let textBytes = 0;
     try {
       for await (const line of lines(http.body)) {
         if (!line.startsWith("data:")) continue;
@@ -217,7 +260,9 @@ export function openRouter(options: OpenRouterOptions): LlmProvider {
         error ??= chunk.data.error ?? choice?.error;
         const content = choice?.delta?.content;
         if (content) {
-          response.text += content;
+          textBytes += Buffer.byteLength(content);
+          if (textBytes <= maxStoredTextBytes) response.text += content;
+          else response.truncated = true;
           input.onDelta(content);
         }
         if (choice?.finish_reason) {
@@ -251,7 +296,9 @@ export function openRouter(options: OpenRouterOptions): LlmProvider {
       errorClass: timedOut ? "timeout" : "provider",
       reason: timedOut
         ? "OpenRouter did not end the call in time (timeout)"
-        : "OpenRouter could not be reached (provider)",
+        : committed
+          ? "The connection to OpenRouter failed (provider)"
+          : "OpenRouter could not be reached (provider)",
       committed,
       text: response.text,
       ...(response.usage ? { usage: response.usage } : {}),

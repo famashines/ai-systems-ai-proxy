@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { after, before, test } from "node:test";
-import { classify, failure, openRouter } from "../../src/adapters/openrouter.ts";
+import {
+  classify,
+  failure,
+  maxErrorBytes,
+  maxStoredTextBytes,
+  openRouter,
+} from "../../src/adapters/openrouter.ts";
 import {
   errorReply,
   startMockOpenRouter,
@@ -149,6 +157,8 @@ test("HTTP errors map to the error classes and are not committed", async () => {
     [[502, "provider_unavailable"], "provider"],
     [[503, "provider_overloaded"], "provider"],
     [[504, "timeout"], "timeout"],
+    [[404, "not_found"], "provider"],
+    [[500, "rate_limit_exceeded", { limit_source: null }], "rate_limit"],
   ];
   for (const [args, errorClass] of cases) {
     mock.reply("mock/g", errorReply(...args));
@@ -188,39 +198,57 @@ test("usage with no cost keeps the tokens for the catalog price", async () => {
   assert.deepEqual(result.ok && result.usage, { inputTokens: 5, outputTokens: 1, cachedTokens: 0 });
 });
 
-test("a call that does not answer in time is a timeout", async () => {
+test("a timeout before the response headers is committed, because the request was sent", async () => {
   mock.reply("mock/k", { kind: "hang" });
   const { result } = await call("mock/k", AbortSignal.timeout(200)).done;
   assert.deepEqual(result, {
     ok: false,
     errorClass: "timeout",
     reason: "OpenRouter did not end the call in time (timeout)",
-    committed: false,
+    committed: true,
+    text: "",
+  });
+});
+
+test("a socket reset after the request is sent is committed", async () => {
+  mock.reply("mock/reset", { kind: "reset" });
+  const { result } = await call("mock/reset").done;
+  assert.deepEqual(result, {
+    ok: false,
+    errorClass: "provider",
+    reason: "The connection to OpenRouter failed (provider)",
+    committed: true,
     text: "",
   });
 });
 
 test("a timeout in the middle of the stream is committed", async () => {
   const controller = new AbortController();
-  mock.reply(
-    "mock/l",
-    streamOf(
-      "mock/l",
-      Array.from({ length: 400 }, () => "token "),
-    ),
-  );
+  mock.reply("mock/l", {
+    kind: "stream",
+    events: [{ choices: [{ delta: { content: "token" }, finish_reason: null }] }],
+    hold: true,
+  });
   const { deltas, done } = call("mock/l", controller.signal);
   setTimeout(() => {
     controller.abort();
-  }, 30);
+  }, 200);
   const { result } = await done;
   assert.equal(!result.ok && result.errorClass, "timeout");
   assert.equal(!result.ok && result.committed, true);
   assert.ok(deltas.length > 0);
 });
 
-test("a server that cannot be reached is a provider failure", async () => {
-  const closed = openRouter({ baseUrl: "http://127.0.0.1:1/api/v1", apiKey: fakeKey, zdr: true });
+test("a server that refuses the connection is a provider failure that is not committed", async () => {
+  const server = createServer();
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as AddressInfo;
+  await new Promise((resolve) => server.close(resolve));
+  const closed = openRouter({
+    baseUrl: `http://127.0.0.1:${String(port)}/api/v1`,
+    apiKey: fakeKey,
+    zdr: true,
+  });
   const { result } = await closed.complete({
     model: "mock/m",
     messages: [{ role: "user", content: "Hello" }],
@@ -266,4 +294,26 @@ test("classify follows the error type before the status", () => {
     failure("error", 400, { metadata: { error_type: "Bad Type!" } }).reason,
     "OpenRouter error 400 (invalid)",
   );
+});
+
+test("an error body is read up to 64 KiB only", async () => {
+  mock.reply("mock/n", {
+    kind: "json",
+    status: 500,
+    body: { error: { code: 500, message: "x".repeat(maxErrorBytes * 2) } },
+  });
+  const { result, response } = await call("mock/n").done;
+  assert.equal(!result.ok && result.errorClass, "provider");
+  assert.equal(response.error, undefined);
+});
+
+test("the stored text stops at 1 MiB with a flag, the deltas go on", async () => {
+  const piece = "z".repeat(400 * 1024);
+  mock.reply("mock/o", streamOf("mock/o", [piece, piece, piece]));
+  const { deltas, done } = call("mock/o");
+  const { result, response } = await done;
+  assert.equal(result.ok, true);
+  assert.equal(response.truncated, true);
+  assert.ok(Buffer.byteLength(response.text) <= maxStoredTextBytes);
+  assert.equal(deltas.join("").length, piece.length * 3);
 });
