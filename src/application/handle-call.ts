@@ -1,0 +1,354 @@
+import { setTimeout as sleep } from "node:timers/promises";
+import {
+  deltaSubject,
+  type CallRequestedEventPayloadV1,
+  type DeltaV1,
+  type EventEnvelopeV1,
+  type ReserveFundsReplyV1,
+  type ReserveFundsRequestV1,
+  type SettleReservationReplyV1,
+  type SettleReservationRequestV1,
+} from "@famashines/ai-systems-contracts";
+import type { EventStore } from "@famashines/ai-systems-kit/event-store";
+import type { HandlerContext } from "@famashines/ai-systems-kit/messaging";
+import type { Attempt, Attempts, Bodies, Catalog, Logger } from "../adapters/mongo.ts";
+import type { LlmProvider } from "../adapters/openrouter.ts";
+import {
+  callStreamId,
+  cleanText,
+  evolve,
+  initialState,
+  interrupted,
+  nextStep,
+  outcomeOf,
+  retryable,
+  splitDelta,
+  type CallEvent,
+  type CallState,
+  type Outcome,
+} from "../domain/call.ts";
+import { maxPrice, uncoveredPrice, worstCaseMicroUsd } from "../domain/cost.ts";
+
+export interface Budget {
+  reserve(input: ReserveFundsRequestV1): Promise<ReserveFundsReplyV1>;
+  settle(input: SettleReservationRequestV1): Promise<SettleReservationReplyV1>;
+}
+
+export interface Deps {
+  store: EventStore;
+  attempts: Attempts;
+  bodies: Bodies;
+  catalog: Catalog;
+  budget: Budget;
+  provider: LlmProvider;
+  publish: (subject: string, delta: DeltaV1) => void;
+  newId: () => string;
+  now: () => number;
+  stopping: AbortSignal;
+  logger: Logger;
+  heartbeatMs?: number;
+}
+
+export type CallRequested = EventEnvelopeV1 & {
+  type: "orchestration.CallRequested";
+  payload: CallRequestedEventPayloadV1;
+};
+
+export class StoppingError extends Error {
+  constructor() {
+    super("The service stops; the call comes again");
+    this.name = "StoppingError";
+  }
+}
+
+const stopped = (deps: Deps): boolean => deps.stopping.aborted;
+
+export const reserveMarginMs = 60_000;
+export const maxCallMs = 3_540_000;
+export const heartbeatMs = 10_000;
+export const heartbeatStaleMs = 30_000;
+const saveTries = 3;
+
+export async function handleCallRequested(
+  deps: Deps,
+  event: CallRequested,
+  { markProcessed }: Pick<HandlerContext, "markProcessed">,
+): Promise<void> {
+  if (stopped(deps)) throw new StoppingError();
+  const { store } = deps;
+  const call = event.payload;
+  const durationMs = Math.min(call.maxDurationMs, maxCallMs);
+  const streamId = callStreamId(call.callId);
+  const history = await store.readStream(streamId);
+  const past = history.map((stored) => stored as CallEvent);
+  let state: CallState = past.reduce(evolve, initialState);
+  let version = history.length;
+  const failedCost = (events: CallEvent[]): number =>
+    events.reduce(
+      (sum, item) => (item.type === "llm.CallFailed" ? sum + item.payload.costMicroUsd : sum),
+      0,
+    );
+  let spent = failedCost(past);
+  const startedAt = Date.parse(
+    history.findLast((stored) => stored.type === "llm.CallStarted")?.occurredAt ?? "",
+  );
+
+  const append = async (events: CallEvent[]): Promise<void> => {
+    const final = events.reduce(evolve, state).final;
+    await store.append({
+      streamId,
+      expectedVersion: version,
+      events: events.map((item) => ({
+        ...item,
+        schemaVersion: 1,
+        correlationId: event.correlationId,
+        causationId: event.eventId,
+        actor: { kind: "system", id: "ai-proxy" },
+      })),
+      ...(final ? { also: markProcessed } : {}),
+    });
+    state = events.reduce(evolve, state);
+    version += events.length;
+    spent += failedCost(events);
+  };
+
+  const base = (attempt: number) => ({
+    taskId: call.taskId,
+    callId: call.callId,
+    attempt,
+    model: call.models[attempt - 1] ?? "",
+  });
+
+  const refuse = (attempt: number, reason: string, reservationId?: string): Promise<void> =>
+    append([
+      {
+        type: "llm.CallFailed",
+        payload: {
+          ...base(attempt),
+          errorClass: "budget_refused",
+          reason,
+          costMicroUsd: 0,
+          ...(reservationId === undefined ? {} : { reservationId }),
+        },
+      },
+    ]);
+
+  const fail = (attempt: number, errorClass: "invalid" | "provider", reason: string) =>
+    append([
+      {
+        type: "llm.CallFailed",
+        payload: { ...base(attempt), errorClass, reason, costMicroUsd: 0 },
+      },
+    ]);
+
+  interface Done {
+    entry: Attempt;
+    outcome: Outcome;
+    stored: boolean;
+  }
+
+  async function settleQuietly(reservationId: string): Promise<void> {
+    try {
+      await deps.budget.settle({ reservationId, actualMicroUsd: 0 });
+    } catch (error) {
+      deps.logger.warn(
+        { error: (error as Error).name },
+        "the settle of an unanswered reservation failed; it expires",
+      );
+    }
+  }
+
+  async function saveBody(body: Parameters<Bodies["save"]>[0]): Promise<void> {
+    for (let tries = 1; ; tries += 1) {
+      try {
+        await deps.bodies.save(body);
+        return;
+      } catch (error) {
+        if (tries >= saveTries) throw error;
+        await sleep(100 * tries);
+      }
+    }
+  }
+
+  async function run(attempt: number): Promise<Done | undefined> {
+    const { model } = base(attempt);
+    const entry = await deps.catalog.model(model);
+    if (typeof entry === "string") {
+      await (entry === "unavailable"
+        ? fail(attempt, "provider", "The model catalog is not available")
+        : fail(attempt, "invalid", "The model is not in the model catalog"));
+      return undefined;
+    }
+    const extra = uncoveredPrice(entry.pricing);
+    if (extra !== undefined) {
+      const key = /^[a-z0-9_]{1,64}$/.test(extra) ? extra : "an unknown key";
+      await fail(
+        attempt,
+        "invalid",
+        `The model has a price for ${key} that the cost check does not cover`,
+      );
+      return undefined;
+    }
+    const worst = worstCaseMicroUsd(entry, call.messages, call.maxTokens);
+    if (call.maxCostMicroUsd !== undefined && worst > call.maxCostMicroUsd - spent) {
+      await refuse(
+        attempt,
+        `The worst-case cost of ${String(worst)} micro-USD is above the rest of the call limit: ${String(Math.max(0, call.maxCostMicroUsd - spent))} of ${String(call.maxCostMicroUsd)} micro-USD`,
+      );
+      return undefined;
+    }
+    const stored = await deps.attempts.ensure(call.callId, attempt, {
+      reservationId: deps.newId(),
+      bodyId: deps.newId(),
+      amountMicroUsd: worst,
+      maxPrice: maxPrice(entry),
+    });
+    if (stopped(deps)) throw new StoppingError();
+    let reply: ReserveFundsReplyV1;
+    try {
+      reply = await deps.budget.reserve({
+        reservationId: stored.reservationId,
+        taskId: call.taskId,
+        agentId: call.agentId,
+        amountMicroUsd: stored.amountMicroUsd,
+        ttlMs: durationMs + reserveMarginMs,
+      });
+    } catch (error) {
+      deps.logger.warn({ error: (error as Error).name }, "the budget reservation failed");
+      await settleQuietly(stored.reservationId);
+      await refuse(attempt, "The budget service did not answer", stored.reservationId);
+      return undefined;
+    }
+    if (!reply.ok) {
+      await refuse(attempt, reply.reason, stored.reservationId);
+      return undefined;
+    }
+    await append([
+      {
+        type: "llm.CallStarted",
+        payload: {
+          ...base(attempt),
+          agentId: call.agentId,
+          agentVersion: call.agentVersion,
+          reservationId: stored.reservationId,
+        },
+      },
+    ]);
+    let i = 0;
+    const started = deps.now();
+    const beat = (): void => {
+      deps.attempts.beat(call.callId, attempt).catch((error: unknown) => {
+        deps.logger.warn({ error: (error as Error).name }, "the attempt heartbeat failed");
+      });
+    };
+    beat();
+    const heartbeat = setInterval(beat, deps.heartbeatMs ?? heartbeatMs);
+    const { result, request, response } = await deps.provider
+      .complete({
+        model,
+        messages: call.messages,
+        maxTokens: call.maxTokens,
+        maxPrice: stored.maxPrice,
+        signal: AbortSignal.any([AbortSignal.timeout(durationMs), deps.stopping]),
+        onDelta: (text) => {
+          for (const part of splitDelta(cleanText(text))) {
+            deps.publish(deltaSubject(call.taskId, call.callId), { attempt, i, text: part });
+            i += 1;
+          }
+        },
+      })
+      .finally(() => {
+        clearInterval(heartbeat);
+      });
+    const stopping = stopped(deps) && !result.ok;
+    const outcome = stopping
+      ? interrupted(stored.amountMicroUsd)
+      : outcomeOf(result, entry, stored.amountMicroUsd, deps.now() - started);
+    const body = {
+      _id: stored.bodyId,
+      callId: call.callId,
+      attempt,
+      model,
+      request,
+      response: { ...response, text: cleanText(response.text) },
+      outcome,
+      createdAt: new Date(),
+    };
+    if (stopping) {
+      await saveBody(body).catch((error: unknown) => {
+        deps.logger.warn(
+          { error: (error as Error).name },
+          "the body of a stopped attempt was not saved",
+        );
+      });
+      throw new StoppingError();
+    }
+    await saveBody(body);
+    return { entry: stored, outcome, stored: true };
+  }
+
+  async function resume(attempt: number): Promise<Done | "again"> {
+    const entry = await deps.attempts.ensure(call.callId, attempt, {
+      reservationId: deps.newId(),
+      bodyId: deps.newId(),
+      amountMicroUsd: 0,
+      maxPrice: { prompt: 0, completion: 0, request: 0 },
+    });
+    const outcome = await deps.bodies.outcome(entry.bodyId);
+    if (outcome) return { entry, outcome, stored: true };
+    const wait = (entry.heartbeatAt ?? startedAt) + heartbeatStaleMs - deps.now();
+    if (wait > 0) {
+      try {
+        await sleep(wait, undefined, { signal: deps.stopping });
+      } catch {
+        throw new StoppingError();
+      }
+      return "again";
+    }
+    return { entry, outcome: interrupted(entry.amountMicroUsd), stored: false };
+  }
+
+  async function settle(entry: Attempt, outcome: Outcome): Promise<void> {
+    const reply = await deps.budget.settle({
+      reservationId: entry.reservationId,
+      actualMicroUsd: outcome.costMicroUsd,
+    });
+    if (reply.state === "expired" || reply.state === "unknown") {
+      deps.logger.warn({ state: reply.state }, "the reservation was not open at the settle");
+    }
+  }
+
+  async function finish(attempt: number, { entry, outcome, stored }: Done): Promise<void> {
+    await settle(entry, outcome);
+    if (!("errorClass" in outcome)) {
+      await append([
+        {
+          type: "llm.CallCompleted",
+          payload: { ...base(attempt), ...outcome, bodyId: entry.bodyId },
+        },
+      ]);
+      return;
+    }
+    const nextModel = retryable(outcome.errorClass) ? call.models[attempt] : undefined;
+    await append([
+      {
+        type: "llm.CallFailed",
+        payload: {
+          ...base(attempt),
+          ...outcome,
+          ...(stored ? { bodyId: entry.bodyId } : {}),
+          reservationId: entry.reservationId,
+          ...(nextModel === undefined ? {} : { nextModel }),
+        },
+      },
+    ]);
+  }
+
+  for (;;) {
+    const step = nextStep(state, call.models.length);
+    if (step.kind === "done") return;
+    const done = step.kind === "resume" ? await resume(step.attempt) : await run(step.attempt);
+    if (done === "again") return handleCallRequested(deps, event, { markProcessed });
+    if (done) await finish(step.attempt, done);
+  }
+}
