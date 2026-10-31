@@ -1,0 +1,129 @@
+name: release
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+jobs:
+  image:
+    if: >-
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push') ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.SHA }}
+          persist-credentials: false
+
+      - name: Set the image name
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY}:sha-${SHA}" >> "$GITHUB_ENV"
+
+      - name: Build the image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
+        with:
+          context: .
+          load: true
+          tags: ${{ env.IMAGE }}
+          build-args: RELEASE=${{ env.SHA }}
+
+      - name: Make the SBOM
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c
+        with:
+          image: ${{ env.IMAGE }}
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+          upload-artifact: false
+          upload-release-assets: false
+          github-token: ""
+
+      - name: Upload the SBOM
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: sbom.cdx.json
+          path: sbom.cdx.json
+          if-no-files-found: error
+
+      - name: Scan the image
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439
+        with:
+          image: ${{ env.IMAGE }}
+          fail-build: true
+          severity-cutoff: high
+          only-fixed: true
+          output-format: table
+
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push the image
+        id: push
+        run: |
+          docker push "$IMAGE"
+          digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE")"
+          digest="${digest#*@}"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "Pushed ${IMAGE}@${digest}" >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    needs: image
+    if: >-
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push') ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: famashines/gitops
+          token: ${{ secrets.GITOPS_TOKEN }}
+
+      - name: Open or update the gitops pull request with the new image
+        env:
+          GH_TOKEN: ${{ secrets.GITOPS_TOKEN }}
+          DIGEST: ${{ needs.image.outputs.digest }}
+        run: |
+          tag="sha-${SHA}"
+          short="${SHA::7}"
+          branch="release/ai-systems-ai-proxy-prod"
+          title="chore(ai-systems-ai-proxy): release sha-${short} to prod"
+          body="Deploy \`ghcr.io/${GITHUB_REPOSITORY}:${tag}@${DIGEST}\` to prod, from ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${SHA}. The owner merges this pull request."
+          git switch -C "$branch"
+          sed -i -e "s|newTag: .*|newTag: ${tag}|" -e "s|digest: .*|digest: ${DIGEST}|" "kubernetes/ai-systems/ai-systems-ai-proxy/prod/kustomization.yaml"
+          if git diff --quiet; then
+            echo "prod already uses ${tag}"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "$title"
+          git push --force origin "$branch"
+          number="$(gh pr list --head "$branch" --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$number" ]; then
+            gh api -X PATCH "repos/famashines/gitops/pulls/${number}" -f title="$title" -f body="$body" --jq .html_url
+          else
+            gh pr create --base main --head "$branch" --title "$title" --body "$body"
+          fi

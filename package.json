@@ -1,0 +1,49 @@
+{
+  "name": "ai-systems-ai-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Model access service of ai-systems",
+  "license": "UNLICENSED",
+  "type": "module",
+  "engines": {
+    "node": ">=26"
+  },
+  "scripts": {
+    "start": "node src/main.ts",
+    "check": "node node_modules/typescript-7/bin/tsc --noEmit",
+    "lint": "eslint . && prettier --check .",
+    "format": "prettier --write .",
+    "test": "npm run test:domain && npm run test:unit",
+    "test:domain": "node --test --experimental-test-coverage --test-coverage-lines=90 --test-coverage-branches=85 --test-coverage-include='src/domain/**' 'test/unit/**/*.test.ts'",
+    "test:unit": "node --test --experimental-test-coverage --test-coverage-lines=70 --test-coverage-include='src/**' --test-coverage-exclude='src/main.ts' 'test/unit/**/*.test.ts'",
+    "verify": "npm run check && npm run lint && npm test",
+    "test:integration": "node --test --test-timeout=300000 'test/integration/**/*.test.ts'",
+    "mock:openrouter": "node test/mock-openrouter.ts"
+  },
+  "dependencies": {
+    "@famashines/ai-systems-contracts": "github:famashines/ai-systems-contracts#v0.3.0",
+    "@famashines/ai-systems-kit": "github:famashines/ai-systems-kit#v0.3.0",
+    "mongodb": "7.8.0",
+    "zod": "4.6.7"
+  },
+  "overrides": {
+    "@typescript/old": "npm:typescript@6.0.3"
+  },
+  "devDependencies": {
+    "@nats-io/jetstream": "3.4.0",
+    "@types/node": "26.6.6",
+    "eslint": "10.14.0",
+    "prettier": "3.9.10",
+    "testcontainers": "12.2.1",
+    "typescript": "npm:@typescript/typescript6@6.0.2",
+    "typescript-7": "npm:typescript@7.0.2",
+    "typescript-eslint": "8.72.1"
+  },
+  "allowScripts": {
+    "protobufjs": false,
+    "ssh2": false,
+    "cpu-features": false,
+    "github:famashines/ai-systems-kit#7d9c7b83ae2fdf012ba02611518252df309bad64": true,
+    "github:famashines/ai-systems-contracts#9ffcdd3175a8b7119682e0826fdf4438de085fd2": true
+  }
+}
