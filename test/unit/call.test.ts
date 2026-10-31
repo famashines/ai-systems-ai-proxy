@@ -199,3 +199,13 @@ test("an interrupted attempt books the reserved amount as a provider failure", (
     costMicroUsd: 55,
   });
 });
+
+test("a delta is not cut inside a surrogate pair", () => {
+  const text = "a".repeat(deltaChars - 1) + "\u{1F600}" + "b";
+  const parts = splitDelta(text);
+  assert.deepEqual(
+    parts.map((part) => part.length),
+    [deltaChars - 1, 3],
+  );
+  assert.equal(parts.join(""), text);
+});

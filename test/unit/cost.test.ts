@@ -6,6 +6,7 @@ import {
   maxPrice,
   outputTokenBound,
   prices,
+  uncoveredPrice,
   usageMicroUsd,
   worstCaseMicroUsd,
   type CatalogModel,
@@ -43,6 +44,7 @@ test("the worst case uses the bytes of the input, the output margin and the high
   const messages = [{ role: "user" as const, content: "ab" }];
   assert.equal(inputTokenBound(model({ prompt: "0", completion: "0" }), messages), 2 + 16 + 16);
   assert.equal(outputTokenBound(100), 105);
+  assert.equal(outputTokenBound(1), 17);
   const priced = model({
     prompt: "0.000001",
     completion: "0.000002",
@@ -116,4 +118,38 @@ test("property: the worst case is never below the cost of an attempt within the 
     assert.ok(Number.isInteger(worst) && worst >= 0);
     assert.ok(used <= worst, `run ${String(run)}: ${String(used)} > ${String(worst)}`);
   }
+});
+
+test("a price key that the worst case does not cover is found, also in overrides", () => {
+  assert.equal(uncoveredPrice({ prompt: "0.1", completion: "0.1" }), undefined);
+  assert.equal(
+    uncoveredPrice({
+      prompt: "0.1",
+      completion: "0.1",
+      image: "0.01",
+      web_search: "0.02",
+      discount: 0.1,
+      new_fee: "0",
+      overrides: [{ min_prompt_tokens: 200000, utc_days: [1], prompt: "0.2" }],
+    }),
+    undefined,
+  );
+  assert.equal(uncoveredPrice({ prompt: "0", completion: "0", new_fee: "0.001" }), "new_fee");
+  assert.equal(
+    uncoveredPrice({ prompt: "0", completion: "0", overrides: [{ other_fee: "1" }] }),
+    "other_fee",
+  );
+  assert.equal(uncoveredPrice({ prompt: "0", completion: "0", odd: "n/a" }), "odd");
+});
+
+test("the cache read price is in the input rate", () => {
+  const messages = [{ role: "user" as const, content: "" }];
+  assert.equal(
+    worstCaseMicroUsd(
+      model({ prompt: "0", completion: "0", input_cache_read: "0.000001" }),
+      messages,
+      1,
+    ),
+    32,
+  );
 });

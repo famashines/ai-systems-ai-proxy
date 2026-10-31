@@ -133,8 +133,12 @@ export const deltaChars = 16_384;
 
 export function splitDelta(text: string): string[] {
   const parts: string[] = [];
-  for (let start = 0; start < text.length; start += deltaChars) {
-    parts.push(text.slice(start, start + deltaChars));
+  let start = 0;
+  while (start < text.length) {
+    let end = Math.min(start + deltaChars, text.length);
+    if (end < text.length && /[\uD800-\uDBFF]/.test(text.charAt(end - 1))) end -= 1;
+    parts.push(text.slice(start, end));
+    start = end;
   }
   return parts;
 }

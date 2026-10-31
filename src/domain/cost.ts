@@ -4,13 +4,14 @@ import { z } from "zod";
 const decimal = /^\d+(\.\d+)?$/;
 const Price = z.string().max(40).regex(decimal);
 
-export const Pricing = z.object({
+export const Pricing = z.looseObject({
   prompt: Price,
   completion: Price,
   request: Price.optional(),
   internal_reasoning: Price.optional(),
   input_cache_write: Price.optional(),
   input_cache_write_1h: Price.optional(),
+  input_cache_read: Price.optional(),
   overrides: z.array(z.record(z.string(), z.unknown())).max(50).optional(),
 });
 export type Pricing = z.infer<typeof Pricing>;
@@ -35,8 +36,25 @@ const priceKeys = [
   "internal_reasoning",
   "input_cache_write",
   "input_cache_write_1h",
+  "input_cache_read",
 ] as const;
 type PriceKey = (typeof priceKeys)[number];
+
+const notCharged = new Set([
+  "image",
+  "image_token",
+  "image_output",
+  "audio",
+  "audio_output",
+  "input_audio_cache",
+  "web_search",
+  "discount",
+  "overrides",
+  "min_prompt_tokens",
+  "utc_start",
+  "utc_end",
+  "utc_days",
+]);
 
 const attoPerUsd = 10n ** 18n;
 const attoPerMicro = 10n ** 12n;
@@ -47,6 +65,20 @@ export function atto(price: string): bigint {
 }
 
 const max = (values: bigint[]): bigint => values.reduce((a, b) => (b > a ? b : a), 0n);
+
+const charged = (value: unknown): boolean =>
+  !(
+    value == null ||
+    value === 0 ||
+    (typeof value === "string" && decimal.test(value) && atto(value) === 0n)
+  );
+
+export function uncoveredPrice(pricing: Pricing): string | undefined {
+  const known: readonly string[] = priceKeys;
+  return [pricing, ...(pricing.overrides ?? [])]
+    .flatMap((entry) => Object.entries(entry))
+    .find(([key, value]) => !known.includes(key) && !notCharged.has(key) && charged(value))?.[0];
+}
 
 export function prices(pricing: Pricing): Record<PriceKey, bigint> {
   const pick = (key: PriceKey): bigint =>
@@ -62,7 +94,7 @@ const rates = (pricing: Pricing) => {
   const p = prices(pricing);
   return {
     request: p.request,
-    input: max([p.prompt, p.input_cache_write, p.input_cache_write_1h]),
+    input: max([p.prompt, p.input_cache_write, p.input_cache_write_1h, p.input_cache_read]),
     output: max([p.completion, p.internal_reasoning]),
   };
 };
@@ -79,8 +111,10 @@ export function inputTokenBound(model: CatalogModel, messages: readonly CallMess
   return Math.min(bytes, model.contextLength ?? bytes);
 }
 
-export const outputTokenBound = (maxTokens: number): number =>
-  maxTokens + Math.ceil(maxTokens / 20);
+export const outputTokenBound = (maxTokens: number): number => {
+  const tokens = Math.max(maxTokens, 16);
+  return tokens + Math.ceil(tokens / 20);
+};
 
 export function worstCaseMicroUsd(
   model: CatalogModel,
