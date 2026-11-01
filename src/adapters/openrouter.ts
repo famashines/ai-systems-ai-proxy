@@ -300,6 +300,7 @@ export function openRouter(options: OpenRouterOptions): LlmProvider {
           ? "The connection to OpenRouter failed (provider)"
           : "OpenRouter could not be reached (provider)",
       committed,
+      ...(timedOut ? { aborted: true } : {}),
       text: response.text,
       ...(response.usage ? { usage: response.usage } : {}),
     };

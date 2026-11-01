@@ -206,6 +206,7 @@ test("a timeout before the response headers is committed, because the request wa
     errorClass: "timeout",
     reason: "OpenRouter did not end the call in time (timeout)",
     committed: true,
+    aborted: true,
     text: "",
   });
 });
@@ -236,6 +237,7 @@ test("a timeout in the middle of the stream is committed", async () => {
   const { result } = await done;
   assert.equal(!result.ok && result.errorClass, "timeout");
   assert.equal(!result.ok && result.committed, true);
+  assert.equal(!result.ok && result.aborted, true);
   assert.ok(deltas.length > 0);
 });
 

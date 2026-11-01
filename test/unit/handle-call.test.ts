@@ -15,6 +15,8 @@ import { interrupted } from "../../src/domain/call.ts";
 import {
   handleCallRequested,
   heartbeatStaleMs,
+  staleAfterMs,
+  staleReason,
   StoppingError,
   type CallRequested,
   type Deps,
@@ -102,6 +104,8 @@ function setup(options: { provider?: LlmProvider } = {}) {
         beats.push(Date.now());
         return Promise.resolve();
       },
+      reservationId: (id, attempt) =>
+        Promise.resolve(attempts.get(`${id}:${String(attempt)}`)?.reservationId),
     },
     bodies: {
       save: (body) => {
@@ -175,7 +179,7 @@ const request = (overrides: Partial<CallRequested["payload"]> = {}): CallRequest
   schemaVersion: 1,
   streamId: `task-${taskId}`,
   version: 3,
-  occurredAt: "2026-10-31T10:00:00.000Z",
+  occurredAt: new Date().toISOString(),
   correlationId: taskId,
   causationId: "10000000-0000-4000-8000-0000000000bb",
   actor: { kind: "system", id: "orchestration" },
@@ -712,4 +716,102 @@ test("a redelivery uses the stored max_price, not a new catalog price", async ()
     completion: 2,
     request: 0,
   });
+});
+
+test("a request older than 15 minutes makes no reservation and no provider call", async () => {
+  const old = new Date(Date.now() - staleAfterMs - 1000).toISOString();
+  await world.handle({ ...request(), occurredAt: old });
+  assert.equal(world.reserves.length, 0);
+  assert.equal(mock.received.length, 0);
+  assert.deepEqual(await world.events(), [
+    {
+      type: "llm.CallFailed",
+      payload: {
+        taskId,
+        callId,
+        attempt: 1,
+        model: "mock/small",
+        errorClass: "timeout",
+        reason: staleReason,
+        costMicroUsd: 0,
+      },
+    },
+  ]);
+  assert.equal(world.settles.length, 0);
+  assert.equal(world.marked.length, 1);
+});
+
+test("a stale request settles a stored reservation with 0 before CallFailed", async () => {
+  const reservationId = "10000000-0000-4000-8000-0000000000cc";
+  world.attempts.set(`${callId}:1`, {
+    reservationId,
+    bodyId: "10000000-0000-4000-8000-0000000000dd",
+    amountMicroUsd: 300,
+    maxPrice: { prompt: 1, completion: 2, request: 0 },
+  });
+  const old = new Date(Date.now() - staleAfterMs - 1000).toISOString();
+  await world.handle({ ...request(), occurredAt: old });
+  assert.deepEqual(world.settles, [{ reservationId, actualMicroUsd: 0 }]);
+  assert.equal(world.reserves.length, 0);
+  assert.equal(mock.received.length, 0);
+  const events = await world.events();
+  assert.deepEqual(
+    events.map((event) => [event.type, event.payload.errorClass, event.payload.reservationId]),
+    [["llm.CallFailed", "timeout", reservationId]],
+  );
+});
+
+test("a stale attempt 2 after a retryable failure of attempt 1 makes no reservation and ends the call", async () => {
+  mock.reply("mock/small", errorReply(502));
+  const start = Date.now();
+  world.deps.now = () => start + (mock.received.length > 0 ? staleAfterMs + 1000 : 0);
+  await world.handle({ ...request(), occurredAt: new Date(start).toISOString() });
+  const events = await world.events();
+  assert.deepEqual(
+    events.map((event) => [
+      event.type,
+      event.payload.attempt,
+      event.payload.errorClass,
+      event.payload.nextModel,
+    ]),
+    [
+      ["llm.CallStarted", 1, undefined, undefined],
+      ["llm.CallFailed", 1, "provider", "mock/large"],
+      ["llm.CallFailed", 2, "timeout", undefined],
+    ],
+  );
+  assert.equal(events[2]?.payload.reason, staleReason);
+  assert.equal(world.reserves.length, 1);
+  assert.equal(mock.received.length, 1);
+  assert.equal(world.marked.length, 1);
+});
+
+test("a provider failure at the same time as a stop keeps its class and goes to no next model", async () => {
+  const real = openRouter({ baseUrl: mock.url, apiKey: "test-key", zdr: true });
+  const racing = setup({
+    provider: {
+      complete: async (input) => {
+        const call = await real.complete(input);
+        racing.stop.abort();
+        return call;
+      },
+      models: () => real.models(),
+    },
+  });
+  mock.reply("mock/small", errorReply(400));
+  await racing.handle(request());
+  const events = await racing.events();
+  assert.deepEqual(
+    events.map((event) => [event.type, event.payload.errorClass, event.payload.nextModel]),
+    [
+      ["llm.CallStarted", undefined, undefined],
+      ["llm.CallFailed", "invalid", undefined],
+    ],
+  );
+  assert.equal(mock.received.length, 1);
+  assert.deepEqual(
+    racing.settles.map((settle) => settle.actualMicroUsd),
+    [0],
+  );
+  assert.equal(racing.marked.length, 1);
 });

@@ -73,6 +73,7 @@ export type AttemptResult =
       errorClass: LlmErrorClass;
       reason: string;
       committed: boolean;
+      aborted?: true;
       text: string;
       usage?: Usage;
     };

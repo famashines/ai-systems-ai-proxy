@@ -67,6 +67,8 @@ export const reserveMarginMs = 60_000;
 export const maxCallMs = 3_540_000;
 export const heartbeatMs = 10_000;
 export const heartbeatStaleMs = 30_000;
+export const staleAfterMs = 15 * 60_000;
+export const staleReason = "The request is older than 15 minutes, so the call stops";
 const saveTries = 3;
 
 export async function handleCallRequested(
@@ -133,11 +135,22 @@ export async function handleCallRequested(
       },
     ]);
 
-  const fail = (attempt: number, errorClass: "invalid" | "provider", reason: string) =>
+  const fail = (
+    attempt: number,
+    errorClass: "invalid" | "provider" | "timeout",
+    reason: string,
+    reservationId?: string,
+  ) =>
     append([
       {
         type: "llm.CallFailed",
-        payload: { ...base(attempt), errorClass, reason, costMicroUsd: 0 },
+        payload: {
+          ...base(attempt),
+          errorClass,
+          reason,
+          costMicroUsd: 0,
+          ...(reservationId === undefined ? {} : { reservationId }),
+        },
       },
     ]);
 
@@ -171,6 +184,12 @@ export async function handleCallRequested(
   }
 
   async function run(attempt: number): Promise<Done | undefined> {
+    if (deps.now() - Date.parse(event.occurredAt) > staleAfterMs) {
+      const held = await deps.attempts.reservationId(call.callId, attempt);
+      if (held !== undefined) await settleQuietly(held);
+      await fail(attempt, "timeout", staleReason, held);
+      return undefined;
+    }
     const { model } = base(attempt);
     const entry = await deps.catalog.model(model);
     if (typeof entry === "string") {
@@ -260,7 +279,7 @@ export async function handleCallRequested(
       .finally(() => {
         clearInterval(heartbeat);
       });
-    const stopping = stopped(deps) && !result.ok;
+    const stopping = stopped(deps) && !result.ok && result.aborted === true;
     const outcome = stopping
       ? interrupted(stored.amountMicroUsd)
       : outcomeOf(result, entry, stored.amountMicroUsd, deps.now() - started);
