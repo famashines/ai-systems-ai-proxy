@@ -6,7 +6,7 @@ import { createService } from "@famashines/ai-systems-kit/http";
 import { createLogger } from "@famashines/ai-systems-kit/observability";
 import { createMemoryEventStore } from "@famashines/ai-systems-kit/testing";
 import { MongoNetworkError } from "mongodb";
-import { routes } from "../../src/adapters/http.ts";
+import { maxModels, routes } from "../../src/adapters/http.ts";
 import type { CatalogModel } from "../../src/domain/cost.ts";
 import { envSchema } from "../../src/main.ts";
 
@@ -19,7 +19,7 @@ const flaky: EventStore = {
     down ? Promise.reject(new MongoNetworkError("down")) : store.readAll(options),
 };
 const pricing = { prompt: "0", completion: "0" };
-let userModels: CatalogModel[] | "unavailable" = [
+let userModels: CatalogModel[] | "unavailable" | Error = [
   { id: "mock/zeta", name: "Zeta", pricing, efforts: [] },
   {
     id: "mock/alpha",
@@ -29,8 +29,12 @@ let userModels: CatalogModel[] | "unavailable" = [
     defaultEffort: "high",
   },
   { id: "mock/beta", pricing },
+  { id: "mock/fee", name: "Fee", pricing: { ...pricing, new_fee: "0.01" } },
 ];
-const catalog = { userModels: () => Promise.resolve(userModels) };
+const catalog = {
+  userModels: () =>
+    userModels instanceof Error ? Promise.reject(userModels) : Promise.resolve(userModels),
+};
 const app = createService({
   logger,
   routes: routes({ store: flaky, catalog }),
@@ -86,7 +90,7 @@ test("the replay API refuses a bad query and answers 503 when MongoDB is down", 
   down = false;
 });
 
-test("the model list has the user models sorted by name, and 503 with no list", async () => {
+test("the model list has the usable user models sorted by name, and 503 with no list", async () => {
   const response = await fetch(`${base}/internal/models`);
   assert.equal(response.status, 200);
   const body = (await response.json()) as unknown;
@@ -105,6 +109,21 @@ test("the model list has the user models sorted by name, and 503 with no list", 
   });
   userModels = "unavailable";
   assert.equal((await fetch(`${base}/internal/models`)).status, 503);
+  userModels = new MongoNetworkError("down");
+  assert.equal((await fetch(`${base}/internal/models`)).status, 503);
+  userModels = new Error("bug");
+  assert.equal((await fetch(`${base}/internal/models`)).status, 500);
+});
+
+test("the model list has at most the contract limit of items", async () => {
+  userModels = Array.from({ length: maxModels + 1 }, (_, i) => ({
+    id: `mock/m${String(i).padStart(4, "0")}`,
+    pricing,
+  }));
+  const response = await fetch(`${base}/internal/models`);
+  const body = ModelListResultV1.parse(await response.json());
+  assert.equal(body.items.length, maxModels);
+  assert.equal(body.items.at(-1)?.id, "mock/m0999");
 });
 
 test("the config has the defaults and needs the API key", () => {

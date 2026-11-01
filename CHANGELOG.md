@@ -14,8 +14,9 @@
   the first call after the deploy fetches the catalog again.
 - `GET /internal/models`: the models that the key can use, from OpenRouter
   `GET /api/v1/models/user`, cached in the document `openrouter-user-v1`
-  (6 hours), sorted by name, `ModelListResultV1`. 503 when no list is
-  available. api-gateway reaches it only after the gitops network policy
+  (6 hours), sorted by name, at most 1000 items, `ModelListResultV1`. A
+  model with a price key that the cost check does not cover is not in the
+  list. 503 when no list is available or MongoDB is down. api-gateway reaches it only after the gitops network policy
   from api-gateway to ai-proxy.
 - A `CallCompleted.text` cut at 100,000 characters has the finish reason
   `length`.

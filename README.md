@@ -200,7 +200,12 @@ From `ai-systems-docs/research/openrouter.md` (M2-01), which has the sources:
 
 `GET /internal/models` gives one item for each model of the user models
 list: `id`, `name` (the `id` when OpenRouter has no valid name), `efforts`
-and `defaultEffort`. ai-proxy makes `efforts` from the `reasoning` object:
+and `defaultEffort`. A model with a price key that the cost check does
+not cover is not in the list, because a call fails it with `invalid`. The
+list is sorted by `name` and has at most 1000 items (the limit of
+`ModelListResultV1`); ai-proxy drops the items after the first 1000. 503
+when the list is not available, also when MongoDB is down and the pod has
+no list in memory. ai-proxy makes `efforts` from the `reasoning` object:
 
 - `efforts` is always an array, highest effort first.
 - `supported_efforts: null` gives all 7 values of `ReasoningEffort`.
