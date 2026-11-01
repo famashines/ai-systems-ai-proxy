@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
+import { ModelListResultV1 } from "@famashines/ai-systems-contracts";
 import type { EventStore } from "@famashines/ai-systems-kit/event-store";
 import { createService } from "@famashines/ai-systems-kit/http";
 import { createLogger } from "@famashines/ai-systems-kit/observability";
 import { createMemoryEventStore } from "@famashines/ai-systems-kit/testing";
 import { MongoNetworkError } from "mongodb";
 import { routes } from "../../src/adapters/http.ts";
+import type { CatalogModel } from "../../src/domain/cost.ts";
 import { envSchema } from "../../src/main.ts";
 
 const logger = createLogger({ service: "test", release: "test", level: "silent" });
@@ -16,7 +18,24 @@ const flaky: EventStore = {
   readAll: (options) =>
     down ? Promise.reject(new MongoNetworkError("down")) : store.readAll(options),
 };
-const app = createService({ logger, routes: routes({ store: flaky }), drainDelayMs: 0 });
+const pricing = { prompt: "0", completion: "0" };
+let userModels: CatalogModel[] | "unavailable" = [
+  { id: "mock/zeta", name: "Zeta", pricing, efforts: [] },
+  {
+    id: "mock/alpha",
+    name: "Alpha",
+    pricing,
+    efforts: ["high", "low", "none"],
+    defaultEffort: "high",
+  },
+  { id: "mock/beta", pricing },
+];
+const catalog = { userModels: () => Promise.resolve(userModels) };
+const app = createService({
+  logger,
+  routes: routes({ store: flaky, catalog }),
+  drainDelayMs: 0,
+});
 let base = "";
 
 before(async () => {
@@ -65,6 +84,27 @@ test("the replay API refuses a bad query and answers 503 when MongoDB is down", 
   down = true;
   assert.equal((await fetch(`${base}/internal/events`)).status, 503);
   down = false;
+});
+
+test("the model list has the user models sorted by name, and 503 with no list", async () => {
+  const response = await fetch(`${base}/internal/models`);
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as unknown;
+  assert.deepEqual(ModelListResultV1.parse(body), body);
+  assert.deepEqual(body, {
+    items: [
+      {
+        id: "mock/alpha",
+        name: "Alpha",
+        efforts: ["high", "low", "none"],
+        defaultEffort: "high",
+      },
+      { id: "mock/beta", name: "mock/beta", efforts: [] },
+      { id: "mock/zeta", name: "Zeta", efforts: [] },
+    ],
+  });
+  userModels = "unavailable";
+  assert.equal((await fetch(`${base}/internal/models`)).status, 503);
 });
 
 test("the config has the defaults and needs the API key", () => {

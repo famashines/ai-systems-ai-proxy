@@ -77,6 +77,7 @@ export interface Bodies {
 
 export interface Catalog {
   model(id: string): Promise<CatalogModel | "unknown" | "unavailable">;
+  userModels(): Promise<CatalogModel[] | "unavailable">;
 }
 
 export function mongoAttempts(db: Db): Attempts {
@@ -166,6 +167,7 @@ export type Logger = ReturnType<typeof createLogger>;
 export interface CatalogOptions {
   db: Db;
   fetchModels: () => Promise<CatalogModel[]>;
+  fetchUserModels: () => Promise<CatalogModel[]>;
   logger: Logger;
   now?: () => number;
   maxAgeMs?: number;
@@ -173,46 +175,55 @@ export interface CatalogOptions {
 }
 
 export function catalog(options: CatalogOptions): Catalog {
-  const { db, fetchModels, logger } = options;
+  const { db, logger } = options;
   const now = options.now ?? Date.now;
   const maxAgeMs = options.maxAgeMs ?? 6 * 3600_000;
   const retryMs = options.retryMs ?? 60_000;
   const models = db.collection<{ _id: string; fetchedAt: Date; models: CatalogModel[] }>("models");
-  let cache: { fetchedAt: number; byId: Map<string, CatalogModel> } | undefined;
-  let lastTry = Number.NEGATIVE_INFINITY;
   const index = (list: CatalogModel[], fetchedAt: number) => ({
     fetchedAt,
+    list,
     byId: new Map(list.map((model) => [model.id, model])),
   });
 
-  async function fresh() {
-    if (!cache) {
-      const stored = await models.findOne({ _id: "openrouter" });
-      if (stored) cache = index(stored.models, stored.fetchedAt.getTime());
-    }
-    const time = now();
-    if ((cache && time - cache.fetchedAt < maxAgeMs) || time - lastTry < retryMs) return cache;
-    lastTry = time;
-    try {
-      const list = await fetchModels();
-      await models.replaceOne(
-        { _id: "openrouter" },
-        { fetchedAt: new Date(time), models: list },
-        { upsert: true },
-      );
-      cache = index(list, time);
-      logger.info({ models: list.length }, "model catalog refreshed");
-    } catch (error) {
-      logger.warn({ error: (error as Error).name }, "model catalog refresh failed");
-    }
-    return cache;
+  function cached(key: string, fetchModels: () => Promise<CatalogModel[]>) {
+    let cache: ReturnType<typeof index> | undefined;
+    let lastTry = Number.NEGATIVE_INFINITY;
+    return async function fresh() {
+      if (!cache) {
+        const stored = await models.findOne({ _id: key });
+        if (stored) cache = index(stored.models, stored.fetchedAt.getTime());
+      }
+      const time = now();
+      if ((cache && time - cache.fetchedAt < maxAgeMs) || time - lastTry < retryMs) return cache;
+      lastTry = time;
+      try {
+        const list = await fetchModels();
+        await models.replaceOne(
+          { _id: key },
+          { fetchedAt: new Date(time), models: list },
+          { upsert: true },
+        );
+        cache = index(list, time);
+        logger.info({ catalog: key, models: list.length }, "model catalog refreshed");
+      } catch (error) {
+        logger.warn({ catalog: key, error: (error as Error).name }, "model catalog refresh failed");
+      }
+      return cache;
+    };
   }
+
+  const all = cached("openrouter-v2", options.fetchModels);
+  const user = cached("openrouter-user-v1", options.fetchUserModels);
 
   return {
     async model(id) {
-      const current = await fresh();
+      const current = await all();
       if (!current) return "unavailable";
       return current.byId.get(id) ?? "unknown";
+    },
+    async userModels() {
+      return (await user())?.list ?? "unavailable";
     },
   };
 }

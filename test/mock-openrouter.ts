@@ -15,6 +15,7 @@ export interface Received {
 export interface MockOpenRouter {
   url: string;
   received: Received[];
+  lists: { url: string; headers: IncomingHttpHeaders }[];
   models: unknown[];
   reply(model: string, ...replies: Reply[]): void;
   close(): Promise<void>;
@@ -87,12 +88,19 @@ export const errorReply = (status: number, errorType?: string, metadata: object 
 export const defaultModels: unknown[] = [
   {
     id: "mock/small",
+    name: "Mock: Small",
     context_length: 8192,
     pricing: { prompt: "0.000001", completion: "0.000002" },
   },
   {
     id: "mock/large",
+    name: "Mock: Large",
     context_length: 128000,
+    reasoning: {
+      supported_efforts: ["high", "medium", "low", "none"],
+      default_effort: "medium",
+      mandatory: false,
+    },
     pricing: {
       prompt: "0.0000025",
       completion: "0.00001",
@@ -136,13 +144,18 @@ async function send(response: ServerResponse, reply: Reply): Promise<void> {
 
 export async function startMockOpenRouter(port = 0): Promise<MockOpenRouter> {
   const received: Received[] = [];
+  const lists: MockOpenRouter["lists"] = [];
   const scripts = new Map<string, Reply[]>();
   const models = [...defaultModels];
   const server = createServer((request, response) => {
     const chunks: Buffer[] = [];
     request.on("data", (data: Buffer) => chunks.push(data));
     request.on("end", () => {
-      if (request.method === "GET" && request.url === "/api/v1/models") {
+      if (
+        request.method === "GET" &&
+        (request.url === "/api/v1/models" || request.url === "/api/v1/models/user")
+      ) {
+        lists.push({ url: request.url, headers: request.headers });
         void send(response, { kind: "json", status: 200, body: { data: models } });
         return;
       }
@@ -161,6 +174,7 @@ export async function startMockOpenRouter(port = 0): Promise<MockOpenRouter> {
   return {
     url: `http://127.0.0.1:${String(bound)}/api/v1`,
     received,
+    lists,
     models,
     reply(model, ...replies) {
       scripts.set(model, [...(scripts.get(model) ?? []), ...replies]);

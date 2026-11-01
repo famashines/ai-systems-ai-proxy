@@ -4,6 +4,7 @@ import { after, before, test } from "node:test";
 import { jetstream, jetstreamManager, type JetStreamManager } from "@nats-io/jetstream";
 import {
   DeltaV1,
+  ModelListResultV1,
   ReserveFundsReplyV1,
   ReserveFundsRequestV1,
   RpcSubject,
@@ -386,6 +387,35 @@ test("a redelivered CallRequested does not call the provider again", async () =>
   await ended(marker.callId, 2);
   assert.equal(mock.received.length, calls + 1);
   assert.equal((await typesOf(callId)).length, 2);
+});
+
+test("the model list comes from /models/user, and an effort reaches the provider", async () => {
+  const response = await fetch(`${base}/internal/models`);
+  assert.equal(response.status, 200);
+  const { items } = ModelListResultV1.parse(await response.json());
+  assert.deepEqual(
+    items.find((item) => item.id === "mock/large"),
+    {
+      id: "mock/large",
+      name: "Mock: Large",
+      efforts: ["high", "medium", "low", "none"],
+      defaultEffort: "medium",
+    },
+  );
+  assert.ok(mock.lists.some((item) => item.url === "/api/v1/models/user"));
+  const stored = await mongo.db
+    .collection<{ _id: string }>("models")
+    .find({}, { projection: { _id: 1 } })
+    .toArray();
+  assert.deepEqual(stored.map((item) => item._id).sort(), ["openrouter-user-v1", "openrouter-v2"]);
+  const { callId, event } = callRequest(["mock/large"], { maxTokens: 2048, effort: "high" });
+  await publish(event);
+  await ended(callId, 2);
+  assert.deepEqual(await typesOf(callId), ["llm.CallStarted", "llm.CallCompleted"]);
+  const received = mock.received.find(
+    (item) => item.body.model === "mock/large" && item.body.max_tokens === 2048,
+  );
+  assert.deepEqual(received?.body.reasoning, { effort: "high" });
 });
 
 test("the replay API gives the llm events", async () => {

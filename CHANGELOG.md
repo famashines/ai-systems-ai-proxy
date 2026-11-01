@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- Contracts v0.5.0. A `CallRequested` can have `maxTokens` up to 32000
+  and an `effort`. Deploy this before the other services move to v0.5.0.
+- The `effort` of a `CallRequested` goes to OpenRouter as
+  `reasoning: { effort }`. An effort that the model does not have, or an
+  effort other than `none` with `maxTokens` 1024 or less, gives
+  `CallFailed` `invalid`, cost 0, no reservation.
+- The catalog has the `name`, the `efforts` and the `defaultEffort` of
+  each model, from the `reasoning` object. A bad `reasoning` object or name
+  does not drop the model. The catalog document is now `openrouter-v2`, so
+  the first call after the deploy fetches the catalog again.
+- `GET /internal/models`: the models that the key can use, from OpenRouter
+  `GET /api/v1/models/user`, cached in the document `openrouter-user-v1`
+  (6 hours), sorted by name, `ModelListResultV1`. 503 when no list is
+  available. api-gateway reaches it only after the gitops network policy
+  from api-gateway to ai-proxy.
+- A `CallCompleted.text` cut at 100,000 characters has the finish reason
+  `length`.
+- One warning in the log when the usage has more output tokens than the
+  output bound of the worst case.
+- The mock OpenRouter serves `GET /api/v1/models/user` and records the
+  list requests.
 - Fixed: a model with a `web_search` price is no longer refused. The worst case and the cost from tokens add one search unit for each attempt. Before, the OpenRouter catalog listed `web_search` for normal models, so every call failed with `invalid`.
 - Contracts v0.4.1.
 - Second durable consumer `ai-proxy-cancel` on `ORCHESTRATION`, filter

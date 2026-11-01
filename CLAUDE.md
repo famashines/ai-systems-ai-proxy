@@ -59,7 +59,7 @@ the kernel of `ubuntu-24.04`).
 
 ## Dependencies
 
-- Kit (v0.3.0) and contracts (v0.4.1) come from git tags. A new tag needs a new
+- Kit (v0.3.0) and contracts (v0.5.0) come from git tags. A new tag needs a new
   `allowScripts` entry with the commit of the tag
   (`npm install-scripts approve <package>`).
 - `mongodb` and `zod` have the exact versions that the kit pins. Check

@@ -106,9 +106,10 @@ export function outcomeOf(
   const committed = result.ok || result.committed;
   const costMicroUsd = usage ? usageMicroUsd(model, usage) : committed ? reservedMicroUsd : 0;
   if (result.ok) {
+    const text = cleanText(result.text);
     return {
-      text: eventText(cleanText(result.text)),
-      finishReason: finishReason(result.finishReason),
+      text: eventText(text),
+      finishReason: text.length > maxOutputChars ? "length" : finishReason(result.finishReason),
       inputTokens: usage?.inputTokens ?? 0,
       outputTokens: usage?.outputTokens ?? 0,
       cachedTokens: usage?.cachedTokens ?? 0,
