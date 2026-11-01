@@ -116,6 +116,22 @@ test("the model list has the usable user models sorted by name, and 503 with no 
   assert.equal((await fetch(`${base}/internal/models`)).status, 500);
 });
 
+async function listedIds(modelList: string[]) {
+  const listed = createService({
+    logger,
+    routes: routes({ store, catalog, modelList }),
+    drainDelayMs: 0,
+  });
+  const address = await listed.listen(0);
+  try {
+    const response = await fetch(`http://127.0.0.1:${String(address.port)}/internal/models`);
+    assert.equal(response.status, 200);
+    return ModelListResultV1.parse(await response.json()).items.map((item) => item.id);
+  } finally {
+    await listed.close();
+  }
+}
+
 test("the model list has at most the contract limit of items", async () => {
   userModels = Array.from({ length: maxModels + 1 }, (_, i) => ({
     id: `mock/m${String(i).padStart(4, "0")}`,
@@ -125,6 +141,7 @@ test("the model list has at most the contract limit of items", async () => {
   const body = ModelListResultV1.parse(await response.json());
   assert.equal(body.items.length, maxModels);
   assert.equal(body.items.at(-1)?.id, "mock/m0999");
+  assert.deepEqual(await listedIds(["mock/m1000", "mock/m0000"]), ["mock/m0000", "mock/m1000"]);
 });
 
 test("a model list in the config keeps only its usable models, still sorted by name", async () => {
@@ -134,27 +151,10 @@ test("a model list in the config keeps only its usable models, still sorted by n
     { id: "mock/beta", pricing },
     { id: "mock/fee", name: "Fee", pricing: { ...pricing, new_fee: "0.01" } },
   ];
-  const listed = createService({
-    logger,
-    routes: routes({
-      store,
-      catalog,
-      modelList: ["mock/zeta", "mock/fee", "mock/alpha", "mock/gone"],
-    }),
-    drainDelayMs: 0,
-  });
-  const address = await listed.listen(0);
-  try {
-    const response = await fetch(`http://127.0.0.1:${String(address.port)}/internal/models`);
-    assert.equal(response.status, 200);
-    const body = ModelListResultV1.parse(await response.json());
-    assert.deepEqual(
-      body.items.map((item) => item.id),
-      ["mock/alpha", "mock/zeta"],
-    );
-  } finally {
-    await listed.close();
-  }
+  assert.deepEqual(await listedIds(["mock/zeta", "mock/fee", "mock/alpha", "mock/gone"]), [
+    "mock/alpha",
+    "mock/zeta",
+  ]);
 });
 
 test("the config has the defaults and needs the API key", () => {
