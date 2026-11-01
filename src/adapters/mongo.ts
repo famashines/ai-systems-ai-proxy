@@ -28,6 +28,7 @@ export interface Attempt {
 export interface Attempts {
   ensure(callId: string, attempt: number, init: Omit<Attempt, "heartbeatAt">): Promise<Attempt>;
   beat(callId: string, attempt: number): Promise<void>;
+  reservationId(callId: string, attempt: number): Promise<string | undefined>;
 }
 
 export interface CallBody {
@@ -76,6 +77,9 @@ export function mongoAttempts(db: Db): Attempts {
         { _id: key(callId, attempt) },
         { $set: { heartbeatAt: new Date() } },
       );
+    },
+    async reservationId(callId, attempt) {
+      return (await attempts.findOne({ _id: key(callId, attempt) }))?.reservationId;
     },
   };
 }

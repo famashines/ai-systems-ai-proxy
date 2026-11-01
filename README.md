@@ -30,12 +30,13 @@ A stopping pod starts no new call: the handler checks the stop at its
 start and again before the reserve.
 
 A request older than 15 minutes (its envelope `occurredAt`, the stale
-rule of orchestration) starts no new attempt: no reservation and no
-provider call. It gives `CallFailed` `invalid` and ends the call, so
-orchestration logs it as a late call event when the task is closed.
-`invalid` because the contract has only two classes with no next model:
-`budget_refused` makes orchestration block the run for the owner, and a
-stale request is not a budget problem.
+rule of orchestration) starts no new attempt: no new reservation and no
+provider call. When the attempt has a stored reservation (reserved, but
+no `CallStarted`), the handler settles it with 0 first. It gives
+`CallFailed` `timeout` with no `nextModel`, so the call ends (a missing
+`nextModel` ends a call for each class). Orchestration maps `timeout` to
+`unavailable`, the same code as its own stale rule, and logs the event as
+a late call event when the task is closed.
 
 | Step        | Rule                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -69,9 +70,9 @@ text is in the call body.
 | Class            | From                                                                                                                                                                                                                          | Next model |
 | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
 | `rate_limit`     | 429, `rate_limit_exceeded`, 402 with `limit_source` `openrouter_in_flight_budget`                                                                                                                                             | yes        |
-| `timeout`        | 408, 504, 524, `timeout`, no end in the call time                                                                                                                                                                             | yes        |
+| `timeout`        | 408, 504, 524, `timeout`, no end in the call time; a request older than 15 minutes (no next model)                                                                                                                            | yes        |
 | `provider`       | 404 (also "no endpoint" for the `zdr`, `data_collection` or `max_price` rules), 5xx, 529, `provider_unavailable`, `provider_overloaded`, `server`, a network error, a bad chunk, a stream with no end, a crash in the attempt | yes        |
-| `invalid`        | other 4xx (400, 401, 403, 413, 422 ...), a model that is not in the catalog, a price key that is not covered, a request older than 15 minutes                                                                                 | no         |
+| `invalid`        | other 4xx (400, 401, 403, 413, 422 ...), a model that is not in the catalog, a price key that is not covered                                                                                                                  | no         |
 | `budget_refused` | budget refusal or no answer, the call limit, 402 (credits, key limit), 403 with a `limit_source`                                                                                                                              | no         |
 
 The `error.metadata.error_type` wins over the HTTP status. A mid-stream
@@ -91,7 +92,7 @@ redelivery of CallRequested
   attempt n started, no body, heartbeat fresh --> wait until it is 30 s old, then read the stream again
   attempt n started, no body, heartbeat old   --> CallFailed provider, cost = reserved amount, next model
   attempt n not started                       --> same reservationId, amount and max_price, reserve again
-  attempt n not started, request too old      --> CallFailed invalid, no reservation, no provider call
+  attempt n not started, request too old      --> settle a stored reservation with 0, CallFailed timeout, no provider call
 ```
 
 - Stop: when the stop aborts a running call, the handler saves the body

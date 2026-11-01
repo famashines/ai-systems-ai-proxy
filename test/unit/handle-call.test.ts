@@ -104,6 +104,8 @@ function setup(options: { provider?: LlmProvider } = {}) {
         beats.push(Date.now());
         return Promise.resolve();
       },
+      reservationId: (id, attempt) =>
+        Promise.resolve(attempts.get(`${id}:${String(attempt)}`)?.reservationId),
     },
     bodies: {
       save: (body) => {
@@ -729,12 +731,58 @@ test("a request older than 15 minutes makes no reservation and no provider call"
         callId,
         attempt: 1,
         model: "mock/small",
-        errorClass: "invalid",
+        errorClass: "timeout",
         reason: staleReason,
         costMicroUsd: 0,
       },
     },
   ]);
+  assert.equal(world.settles.length, 0);
+  assert.equal(world.marked.length, 1);
+});
+
+test("a stale request settles a stored reservation with 0 before CallFailed", async () => {
+  const reservationId = "10000000-0000-4000-8000-0000000000cc";
+  world.attempts.set(`${callId}:1`, {
+    reservationId,
+    bodyId: "10000000-0000-4000-8000-0000000000dd",
+    amountMicroUsd: 300,
+    maxPrice: { prompt: 1, completion: 2, request: 0 },
+  });
+  const old = new Date(Date.now() - staleAfterMs - 1000).toISOString();
+  await world.handle({ ...request(), occurredAt: old });
+  assert.deepEqual(world.settles, [{ reservationId, actualMicroUsd: 0 }]);
+  assert.equal(world.reserves.length, 0);
+  assert.equal(mock.received.length, 0);
+  const events = await world.events();
+  assert.deepEqual(
+    events.map((event) => [event.type, event.payload.errorClass, event.payload.reservationId]),
+    [["llm.CallFailed", "timeout", reservationId]],
+  );
+});
+
+test("a stale attempt 2 after a retryable failure of attempt 1 makes no reservation and ends the call", async () => {
+  mock.reply("mock/small", errorReply(502));
+  const start = Date.now();
+  world.deps.now = () => start + (mock.received.length > 0 ? staleAfterMs + 1000 : 0);
+  await world.handle({ ...request(), occurredAt: new Date(start).toISOString() });
+  const events = await world.events();
+  assert.deepEqual(
+    events.map((event) => [
+      event.type,
+      event.payload.attempt,
+      event.payload.errorClass,
+      event.payload.nextModel,
+    ]),
+    [
+      ["llm.CallStarted", 1, undefined, undefined],
+      ["llm.CallFailed", 1, "provider", "mock/large"],
+      ["llm.CallFailed", 2, "timeout", undefined],
+    ],
+  );
+  assert.equal(events[2]?.payload.reason, staleReason);
+  assert.equal(world.reserves.length, 1);
+  assert.equal(mock.received.length, 1);
   assert.equal(world.marked.length, 1);
 });
 
