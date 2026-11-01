@@ -134,7 +134,8 @@ test("a price key that the worst case does not cover is found, also in overrides
     undefined,
   );
   assert.equal(uncoveredPrice({ prompt: "0", completion: "0", new_fee: "0.001" }), "new_fee");
-  for (const key of ["web_search", "image_output", "image_token"]) {
+  assert.equal(uncoveredPrice({ prompt: "0", completion: "0", web_search: "0.01" }), undefined);
+  for (const key of ["image_output", "image_token"]) {
     assert.equal(uncoveredPrice({ prompt: "0", completion: "0", [key]: "0.01" }), key);
     assert.equal(uncoveredPrice({ prompt: "0", completion: "0", [key]: "0" }), undefined);
   }
@@ -145,6 +146,13 @@ test("a price key that the worst case does not cover is found, also in overrides
     "other_fee",
   );
   assert.equal(uncoveredPrice({ prompt: "0", completion: "0", odd: "n/a" }), "odd");
+});
+
+test("one web search unit is in the worst case and in the cost from tokens", () => {
+  const messages = [{ role: "user" as const, content: "" }];
+  const searched = model({ prompt: "0", completion: "0", web_search: "0.004" });
+  assert.equal(worstCaseMicroUsd(searched, messages, 1), 4000);
+  assert.equal(usageMicroUsd(searched, { inputTokens: 0, outputTokens: 0, cachedTokens: 0 }), 4000);
 });
 
 test("the cache read price is in the input rate", () => {

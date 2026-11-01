@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Fixed: a model with a `web_search` price is no longer refused. The worst case and the cost from tokens add one search unit for each attempt. Before, the OpenRouter catalog listed `web_search` for normal models, so every call failed with `invalid`.
 - Contracts v0.4.1.
 - Second durable consumer `ai-proxy-cancel` on `ORCHESTRATION`, filter
   `orchestration.CallCancelRequested` (task M3-11). A cancel is stored in
