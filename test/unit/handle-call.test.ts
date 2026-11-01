@@ -10,7 +10,7 @@ import { UnavailableError } from "@famashines/ai-systems-kit/http";
 import { createLogger } from "@famashines/ai-systems-kit/observability";
 import { createMemoryEventStore, fakeIds, waitFor } from "@famashines/ai-systems-kit/testing";
 import type { Attempt, AttemptCost, CallBody } from "../../src/adapters/mongo.ts";
-import { openRouter, type LlmProvider } from "../../src/adapters/openrouter.ts";
+import { openRouter } from "../../src/adapters/openrouter.ts";
 import { cancelReason, interrupted } from "../../src/domain/call.ts";
 import {
   handleCallCancelRequested,
@@ -51,6 +51,11 @@ const catalogModels: Record<string, CatalogModel> = {
     id: "mock/new-fee",
     pricing: { prompt: "0.000001", completion: "0.000002", new_fee: "0.01" },
   },
+  "mock/think": {
+    id: "mock/think",
+    pricing: { prompt: "0.000001", completion: "0.000002" },
+    efforts: ["high", "medium", "low", "none"],
+  },
   "mock/vision": {
     id: "mock/vision",
     pricing: { prompt: "0.000001", completion: "0.000002", image: "0.001" },
@@ -73,7 +78,7 @@ beforeEach(() => {
   world = setup();
 });
 
-function setup(options: { provider?: LlmProvider; cancels?: Set<string> } = {}) {
+function setup(options: { provider?: Deps["provider"]; cancels?: Set<string> } = {}) {
   const store = createMemoryEventStore();
   const attempts = new Map<string, Attempt & Partial<AttemptCost>>();
   const cancels = options.cancels ?? new Set<string>();
@@ -465,7 +470,6 @@ test("a redelivery after a crash in the stream books the reserved amount and goe
   const crashing = setup({
     provider: {
       complete: () => Promise.reject(new Error("crash in the stream")),
-      models: () => Promise.resolve([]),
     },
   });
   await assert.rejects(crashing.handle(request()), /crash/);
@@ -545,7 +549,6 @@ test(
     const crashing = setup({
       provider: {
         complete: () => Promise.reject(new Error("crash in the stream")),
-        models: () => Promise.resolve([]),
       },
     });
     await assert.rejects(crashing.handle(request({ maxDurationMs: 600_000 })), /crash/);
@@ -691,7 +694,6 @@ test("a started attempt with no body waits while its heartbeat is fresh", async 
   const crashing = setup({
     provider: {
       complete: () => Promise.reject(new Error("crash in the stream")),
-      models: () => Promise.resolve([]),
     },
   });
   await assert.rejects(crashing.handle(request()), /crash/);
@@ -713,7 +715,6 @@ test("a stop during the heartbeat wait throws", async () => {
   const crashing = setup({
     provider: {
       complete: () => Promise.reject(new Error("crash in the stream")),
-      models: () => Promise.resolve([]),
     },
   });
   await assert.rejects(crashing.handle(request()), /crash/);
@@ -827,7 +828,6 @@ test("a provider failure at the same time as a stop keeps its class and goes to 
         racing.stop.abort();
         return call;
       },
-      models: () => real.models(),
     },
   });
   mock.reply("mock/small", errorReply(400));
@@ -1024,7 +1024,6 @@ test("a cancelled call that crashed in the stream ends as cancelled with no next
   const crashing = setup({
     provider: {
       complete: () => Promise.reject(new Error("crash in the stream")),
-      models: () => Promise.resolve([]),
     },
   });
   await assert.rejects(crashing.handle(request()), /crash/);
@@ -1076,5 +1075,60 @@ test("a CallRequested with a kind and a subtaskId runs as before", async () => {
   assert.deepEqual(
     (await world.events()).map((event) => event.type),
     ["llm.CallStarted", "llm.CallCompleted"],
+  );
+});
+
+test("an effort goes to the provider only when the call has one", async () => {
+  await world.handle(request({ models: ["mock/think"], maxTokens: 2048, effort: "low" }));
+  assert.equal((await world.events()).at(-1)?.type, "llm.CallCompleted");
+  assert.deepEqual(mock.received[0]?.body.reasoning, { effort: "low" });
+  world = setup();
+  await world.handle(request({ models: ["mock/think"] }));
+  assert.equal("reasoning" in (mock.received[1]?.body ?? {}), false);
+});
+
+test("an effort that the model does not have is invalid, with no reserve and cost 0", async () => {
+  await world.handle(request({ models: ["mock/think"], maxTokens: 2048, effort: "max" }));
+  const events = await world.events();
+  assert.deepEqual(
+    events.map((event) => [event.type, event.payload.errorClass, event.payload.costMicroUsd]),
+    [["llm.CallFailed", "invalid", 0]],
+  );
+  assert.equal(events[0]?.payload.reason, "The model has no reasoning effort max");
+  assert.equal(world.reserves.length, 0);
+  assert.equal(mock.received.length, 0);
+  world = setup();
+  await world.handle(request({ models: ["mock/small"], maxTokens: 2048, effort: "none" }));
+  assert.equal((await world.events())[0]?.payload.errorClass, "invalid");
+  assert.equal(world.reserves.length, 0);
+});
+
+test("an effort other than none needs maxTokens above 1024", async () => {
+  await world.handle(request({ models: ["mock/think"], maxTokens: 1024, effort: "high" }));
+  const events = await world.events();
+  assert.equal(events.length, 1);
+  assert.equal(events[0]?.payload.errorClass, "invalid");
+  assert.equal(events[0].payload.reason, "A reasoning effort needs maxTokens above 1024");
+  assert.equal(world.reserves.length, 0);
+  assert.equal(mock.received.length, 0);
+  world = setup();
+  await world.handle(request({ models: ["mock/think"], maxTokens: 1024, effort: "none" }));
+  assert.equal((await world.events()).at(-1)?.type, "llm.CallCompleted");
+  assert.deepEqual(mock.received[0]?.body.reasoning, { effort: "none" });
+});
+
+test("output tokens above the output bound give one warning", async (t) => {
+  const warn = t.mock.method(world.deps.logger, "warn");
+  mock.reply("mock/small", streamOf("mock/small", ["Long"], { usage: usage(10, 2000) }));
+  await world.handle(request());
+  assert.equal((await world.events()).at(-1)?.type, "llm.CallCompleted");
+  assert.deepEqual(
+    warn.mock.calls.map((call) => call.arguments),
+    [
+      [
+        { model: "mock/small", outputTokens: 2000, bound: 105 },
+        "the output tokens are above the output bound of the worst case",
+      ],
+    ],
   );
 });

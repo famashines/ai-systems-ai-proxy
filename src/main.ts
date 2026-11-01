@@ -94,13 +94,19 @@ export async function start(config: Readonly<Config>, options: { drainDelayMs?: 
     zdr: config.OPENROUTER_ZDR === "true",
   });
   const stop = new AbortController();
+  const models = catalog({
+    db: mongo.db,
+    fetchModels: () => provider.models(),
+    fetchUserModels: () => provider.userModels(),
+    logger,
+  });
   const deps = {
     store,
     attempts: mongoAttempts(mongo.db),
     bodies: mongoBodies(mongo.db),
     cancels: mongoCancels(mongo.db),
     calls: new Map<string, AbortController>(),
-    catalog: catalog({ db: mongo.db, fetchModels: () => provider.models(), logger }),
+    catalog: models,
     budget: {
       reserve: (input: ReserveFundsRequestV1) =>
         nats.request(RpcSubject.budgetReserve, ReserveFundsRequestV1, ReserveFundsReplyV1, input),
@@ -145,7 +151,7 @@ export async function start(config: Readonly<Config>, options: { drainDelayMs?: 
   });
   const app = createService({
     logger,
-    routes: routes({ store }),
+    routes: routes({ store, catalog: models }),
     readiness: {
       mongo: mongo.ready,
       migrations: async () =>

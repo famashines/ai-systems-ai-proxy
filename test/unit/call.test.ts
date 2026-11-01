@@ -155,6 +155,26 @@ test("a completed result gives tokens, the cost and clean text", () => {
   );
 });
 
+test("a text cut to the event limit has the finish reason length", () => {
+  const cut = outcomeOf(
+    { ok: true, text: "x".repeat(maxOutputChars) + "\0y", finishReason: "stop" },
+    priced,
+    1,
+    1,
+  );
+  assert.ok("finishReason" in cut);
+  assert.equal(cut.text.length, maxOutputChars);
+  assert.equal(cut.finishReason, "length");
+  const full = outcomeOf(
+    { ok: true, text: "x".repeat(maxOutputChars) + "\0", finishReason: "stop" },
+    priced,
+    1,
+    1,
+  );
+  assert.ok("finishReason" in full);
+  assert.equal(full.finishReason, "stop");
+});
+
 test("a result with no usage books the reserved amount", () => {
   assert.equal(outcomeOf({ ok: true, text: "" }, priced, 777, 1).costMicroUsd, 777);
   const failedLate = outcomeOf(

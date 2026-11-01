@@ -1,4 +1,9 @@
-import { ModelId, type CallMessage, type LlmErrorClass } from "@famashines/ai-systems-contracts";
+import {
+  ModelId,
+  ReasoningEffort,
+  type CallMessage,
+  type LlmErrorClass,
+} from "@famashines/ai-systems-contracts";
 import { z } from "zod";
 import type { AttemptResult } from "../domain/call.ts";
 import { Pricing, type CatalogModel, type Usage } from "../domain/cost.ts";
@@ -7,6 +12,7 @@ export interface ProviderRequest {
   model: string;
   messages: readonly CallMessage[];
   maxTokens: number;
+  effort?: ReasoningEffort;
   maxPrice: { prompt: number; completion: number; request: number };
   signal: AbortSignal;
   onDelta: (text: string) => void;
@@ -31,6 +37,7 @@ export interface ProviderCall {
 export interface LlmProvider {
   complete(request: ProviderRequest): Promise<ProviderCall>;
   models(): Promise<CatalogModel[]>;
+  userModels(): Promise<CatalogModel[]>;
 }
 
 export interface OpenRouterOptions {
@@ -74,9 +81,35 @@ const Chunk = z.object({
 
 const ModelEntry = z.object({
   id: ModelId,
+  name: z.string().min(1).max(200).nullish().catch(null),
   context_length: z.int().positive().nullish(),
   pricing: Pricing,
+  reasoning: z.unknown().optional(),
 });
+
+const Reasoning = z.object({
+  supported_efforts: z.array(z.unknown()).nullish(),
+  default_effort: z.unknown().optional(),
+  mandatory: z.boolean().nullish(),
+});
+
+export function effortsOf(raw: unknown): {
+  efforts: ReasoningEffort[];
+  defaultEffort?: ReasoningEffort;
+} {
+  const parsed = Reasoning.safeParse(raw);
+  if (!parsed.success) return { efforts: [] };
+  const { supported_efforts: supported, default_effort: fallback, mandatory } = parsed.data;
+  const listed =
+    supported === undefined
+      ? []
+      : ReasoningEffort.options.filter(
+          (effort) => supported === null || supported.includes(effort),
+        );
+  const efforts = mandatory === true ? listed.filter((effort) => effort !== "none") : listed;
+  const defaultEffort = efforts.find((effort) => effort !== "none" && effort === fallback);
+  return { efforts, ...(defaultEffort === undefined ? {} : { defaultEffort }) };
+}
 
 const errorTypes: Readonly<Record<string, LlmErrorClass>> = {
   rate_limit_exceeded: "rate_limit",
@@ -198,6 +231,7 @@ export function openRouter(options: OpenRouterOptions): LlmProvider {
       model: input.model,
       messages: input.messages,
       max_tokens: input.maxTokens,
+      ...(input.effort === undefined ? {} : { reasoning: { effort: input.effort } }),
       stream: true,
       service_tier: "default",
       provider: {
@@ -307,8 +341,8 @@ export function openRouter(options: OpenRouterOptions): LlmProvider {
     };
   }
 
-  async function models(): Promise<CatalogModel[]> {
-    const http = await fetch(`${base}/models`, {
+  async function list(path: string): Promise<CatalogModel[]> {
+    const http = await fetch(`${base}${path}`, {
       headers: auth,
       signal: AbortSignal.timeout(options.catalogTimeoutMs ?? 10_000),
     });
@@ -317,12 +351,22 @@ export function openRouter(options: OpenRouterOptions): LlmProvider {
     return data.flatMap((entry) => {
       const parsed = ModelEntry.safeParse(entry);
       if (!parsed.success) return [];
-      const { id, context_length, pricing } = parsed.data;
+      const { id, name, context_length, pricing, reasoning } = parsed.data;
       return [
-        { id, pricing, ...(context_length == null ? {} : { contextLength: context_length }) },
+        {
+          id,
+          pricing,
+          ...(context_length == null ? {} : { contextLength: context_length }),
+          ...(name == null ? {} : { name }),
+          ...effortsOf(reasoning),
+        },
       ];
     });
   }
 
-  return { complete, models };
+  return {
+    complete,
+    models: () => list("/models"),
+    userModels: () => list("/models/user"),
+  };
 }

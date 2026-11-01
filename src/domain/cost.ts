@@ -1,4 +1,4 @@
-import type { CallMessage } from "@famashines/ai-systems-contracts";
+import type { CallMessage, ReasoningEffort } from "@famashines/ai-systems-contracts";
 import { z } from "zod";
 
 const decimal = /^\d+(\.\d+)?$/;
@@ -21,6 +21,9 @@ export interface CatalogModel {
   id: string;
   contextLength?: number;
   pricing: Pricing;
+  name?: string;
+  efforts?: ReasoningEffort[];
+  defaultEffort?: ReasoningEffort;
 }
 
 export interface Usage {

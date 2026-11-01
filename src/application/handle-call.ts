@@ -30,7 +30,7 @@ import {
   type CallState,
   type Outcome,
 } from "../domain/call.ts";
-import { maxPrice, uncoveredPrice, worstCaseMicroUsd } from "../domain/cost.ts";
+import { maxPrice, outputTokenBound, uncoveredPrice, worstCaseMicroUsd } from "../domain/cost.ts";
 
 export interface Budget {
   reserve(input: ReserveFundsRequestV1): Promise<ReserveFundsReplyV1>;
@@ -43,9 +43,9 @@ export interface Deps {
   bodies: Bodies;
   cancels: Cancels;
   calls: Map<string, AbortController>;
-  catalog: Catalog;
+  catalog: Pick<Catalog, "model">;
   budget: Budget;
-  provider: LlmProvider;
+  provider: Pick<LlmProvider, "complete">;
   publish: (subject: string, delta: DeltaV1) => void;
   newId: () => string;
   now: () => number;
@@ -247,6 +247,15 @@ async function runCall(
       );
       return undefined;
     }
+    const { effort } = call;
+    if (effort !== undefined && !(entry.efforts ?? []).includes(effort)) {
+      await fail(attempt, "invalid", `The model has no reasoning effort ${effort}`);
+      return undefined;
+    }
+    if (effort !== undefined && effort !== "none" && call.maxTokens <= 1024) {
+      await fail(attempt, "invalid", "A reasoning effort needs maxTokens above 1024");
+      return undefined;
+    }
     const worst = worstCaseMicroUsd(entry, call.messages, call.maxTokens);
     if (call.maxCostMicroUsd !== undefined && worst > call.maxCostMicroUsd - spent) {
       await refuse(
@@ -315,6 +324,7 @@ async function runCall(
         model,
         messages: call.messages,
         maxTokens: call.maxTokens,
+        ...(effort === undefined ? {} : { effort }),
         maxPrice: stored.maxPrice,
         signal: AbortSignal.any([AbortSignal.timeout(durationMs), deps.stopping, cancel.signal]),
         onDelta: (text) => {
@@ -327,6 +337,13 @@ async function runCall(
       .finally(() => {
         clearInterval(heartbeat);
       });
+    const bound = outputTokenBound(call.maxTokens);
+    if (result.usage && result.usage.outputTokens > bound) {
+      deps.logger.warn(
+        { model, outputTokens: result.usage.outputTokens, bound },
+        "the output tokens are above the output bound of the worst case",
+      );
+    }
     const aborted = !result.ok && result.aborted === true;
     const stopping = aborted && stopped(deps);
     const ended = stopping

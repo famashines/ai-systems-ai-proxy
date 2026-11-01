@@ -4,6 +4,7 @@ import type { AddressInfo } from "node:net";
 import { after, before, test } from "node:test";
 import {
   classify,
+  effortsOf,
   failure,
   maxErrorBytes,
   maxStoredTextBytes,
@@ -82,6 +83,19 @@ test("the request has the privacy flags, the price cap, max_tokens and no app he
   });
   assert.deepEqual(request, received.body);
   assert.equal(JSON.stringify(request).includes(fakeKey), false);
+});
+
+test("an effort goes to the request as reasoning.effort", async () => {
+  await provider().complete({
+    model: "mock/c",
+    messages: [{ role: "user", content: "Hello" }],
+    maxTokens: 2048,
+    effort: "high",
+    maxPrice: { prompt: 0, completion: 0, request: 0 },
+    signal: AbortSignal.timeout(5000),
+    onDelta: () => undefined,
+  });
+  assert.deepEqual(mock.received.at(-1)?.body.reasoning, { effort: "high" });
 });
 
 test("zdr can be turned off", async () => {
@@ -287,9 +301,67 @@ test("the catalog keeps the models with valid prices and sends the key", async (
   );
   assert.deepEqual(models[0], {
     id: "mock/small",
+    name: "Mock: Small",
     contextLength: 8192,
     pricing: { prompt: "0.000001", completion: "0.000002" },
+    efforts: [],
   });
+  assert.deepEqual(models[1]?.efforts, ["high", "medium", "low", "none"]);
+  assert.equal(models[1].defaultEffort, "medium");
+  assert.equal(mock.lists.at(-1)?.url, "/api/v1/models");
+  assert.equal(mock.lists.at(-1)?.headers.authorization, `Bearer ${fakeKey}`);
+});
+
+test("the user models come from /models/user with the key and the same parse", async () => {
+  const models = await provider().userModels();
+  const last = mock.lists.at(-1);
+  assert.equal(last?.url, "/api/v1/models/user");
+  assert.equal(last.headers.authorization, `Bearer ${fakeKey}`);
+  assert.deepEqual(models, await provider().models());
+});
+
+test("a bad name or reasoning object keeps the model", async () => {
+  mock.models.push({
+    id: "mock/odd",
+    name: "",
+    pricing: { prompt: "0", completion: "0" },
+    reasoning: { supported_efforts: "high" },
+  });
+  const odd = (await provider().models()).find((model) => model.id === "mock/odd");
+  mock.models.pop();
+  assert.deepEqual(odd, { id: "mock/odd", pricing: { prompt: "0", completion: "0" }, efforts: [] });
+});
+
+test("effortsOf follows the reasoning object of the model", () => {
+  const all = ["max", "xhigh", "high", "medium", "low", "minimal", "none"];
+  assert.deepEqual(effortsOf({ supported_efforts: null }), { efforts: all });
+  assert.deepEqual(effortsOf({ supported_efforts: null, mandatory: true }), {
+    efforts: all.slice(0, 6),
+  });
+  assert.deepEqual(
+    effortsOf({
+      supported_efforts: ["max", "xhigh", "high", "medium", "low", "none"],
+      default_effort: "high",
+      mandatory: false,
+    }),
+    { efforts: ["max", "xhigh", "high", "medium", "low", "none"], defaultEffort: "high" },
+  );
+  assert.deepEqual(
+    effortsOf({
+      supported_efforts: ["low", "turbo", "high", "minimal", 3],
+      default_effort: "medium",
+      mandatory: true,
+    }),
+    { efforts: ["high", "low", "minimal"] },
+  );
+  assert.deepEqual(effortsOf({ supported_efforts: ["none"], default_effort: "none" }), {
+    efforts: ["none"],
+  });
+  assert.deepEqual(effortsOf({ supported_efforts: ["none"], mandatory: true }), { efforts: [] });
+  assert.deepEqual(effortsOf({ mandatory: false }), { efforts: [] });
+  assert.deepEqual(effortsOf(undefined), { efforts: [] });
+  assert.deepEqual(effortsOf({ supported_efforts: ["high"], mandatory: "yes" }), { efforts: [] });
+  assert.deepEqual(effortsOf("high"), { efforts: [] });
 });
 
 test("a catalog error throws", async () => {
