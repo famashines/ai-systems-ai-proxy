@@ -21,7 +21,7 @@
     "mock:openrouter": "node test/mock-openrouter.ts"
   },
   "dependencies": {
-    "@famashines/ai-systems-contracts": "github:famashines/ai-systems-contracts#v0.3.0",
+    "@famashines/ai-systems-contracts": "github:famashines/ai-systems-contracts#v0.4.1",
     "@famashines/ai-systems-kit": "github:famashines/ai-systems-kit#v0.3.0",
     "mongodb": "7.8.0",
     "zod": "4.6.7"
@@ -44,6 +44,6 @@
     "ssh2": false,
     "cpu-features": false,
     "github:famashines/ai-systems-kit#7d9c7b83ae2fdf012ba02611518252df309bad64": true,
-    "github:famashines/ai-systems-contracts#9ffcdd3175a8b7119682e0826fdf4438de085fd2": true
+    "github:famashines/ai-systems-contracts#9867be1803c333edc6d810a13f59bdf919626475": true
   }
 }
