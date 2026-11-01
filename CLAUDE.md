@@ -22,9 +22,9 @@ Rules for all ai-systems repos: `ai-systems-docs/CLAUDE.md`
 src
 ├── domain/cost.ts             prices, worst case, cost from usage, max_price; no I/O
 ├── domain/call.ts             call state (evolve, next step), outcome, text rules; no I/O
-├── application/handle-call.ts the CallRequested handler: attempts, budget, provider, events
+├── application/handle-call.ts the CallRequested and CallCancelRequested handlers
 ├── adapters/openrouter.ts     the provider port and the OpenRouter adapter (SSE, errors, catalog)
-├── adapters/mongo.ts          attempts, call bodies, catalog cache, own migration
+├── adapters/mongo.ts          attempts, call bodies, cancels, catalog cache, own migrations
 ├── adapters/http.ts           the replay API
 └── main.ts                    config, wiring by constructor, start, shutdown
 test
@@ -59,7 +59,7 @@ the kernel of `ubuntu-24.04`).
 
 ## Dependencies
 
-- Kit and contracts come from git tags (v0.3.0). A new tag needs a new
+- Kit (v0.3.0) and contracts (v0.4.1) come from git tags. A new tag needs a new
   `allowScripts` entry with the commit of the tag
   (`npm install-scripts approve <package>`).
 - `mongodb` and `zod` have the exact versions that the kit pins. Check

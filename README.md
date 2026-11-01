@@ -1,7 +1,8 @@
 # ai-systems-ai-proxy
 
 The Model Access service of ai-systems. It reads `orchestration.CallRequested`
-from the stream `ORCHESTRATION`, reserves the worst-case cost with the budget
+and `orchestration.CallCancelRequested` from the stream `ORCHESTRATION`
+(two durable consumers), reserves the worst-case cost with the budget
 service, calls OpenRouter with streaming, sends each token delta to core
 NATS, settles the real cost, and appends `llm.CallStarted`,
 `llm.CallCompleted` and `llm.CallFailed` to the stream `call-<callId>` in
@@ -15,14 +16,16 @@ ai-proxy, for each attempt (models[0], then the next model on a retryable failur
   --> POST /chat/completions (SSE) --> delta.<taskId>.<callId> (core NATS)
   --> call body (MongoDB) --> rpc.budget.settle
   --> llm.CallCompleted, or llm.CallFailed (nextModel when one is left)
-MongoDB ai_proxy: events, call_bodies, attempts, models --outbox--> LLM
+orchestration --orchestration.CallCancelRequested (ORCHESTRATION)--> ai-proxy
+  --> cancels (MongoDB) --> abort the running call --> llm.CallFailed cancelled
+MongoDB ai_proxy: events, call_bodies, attempts, cancels, models --outbox--> LLM
 projections --GET /internal/events--> ai-proxy (rebuild only)
 ```
 
 Architecture and reasons: `ai-systems-docs` (`ARCHITECTURE.md` 3, 6, 7,
 ADR 0014, 0015, 0019, 0023, 0025, `research/openrouter.md`). Contracts:
-`@famashines/ai-systems-contracts` v0.3.0, README sections "LLM calls",
-"Budget rpc" and "Deltas".
+`@famashines/ai-systems-contracts` v0.4.1, README sections "LLM calls",
+"Tasks and plans", "Budget rpc" and "Deltas".
 
 ## One call
 
@@ -52,6 +55,7 @@ a late call event when the task is closed.
 | Body        | The request body and the response (text, finish reason, usage, error, generation id, status) are stored in `call_bodies` with the outcome, before the settle. No headers, so no API key. The error body is read up to 64 KiB. The stored text stops at 1 MiB with `truncated: true`. A failed save is tried 3 times, then the handler throws. Kept 90 days.                                                                                                                                                                                                                                                                                               |
 | Settle      | The real cost. A settle that fails throws before the end event. The next delivery takes the outcome from the body and settles again; `already_settled` makes this safe.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | End         | `CallCompleted` (also with empty text; orchestration makes `RunFailed` `empty_output`), or `CallFailed`. The last event and the `processed` marker are in one transaction.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| Totals      | The tokens and the cost of each attempt are stored on its `attempts` document after the settle. The final event (`CallCompleted`, or `CallFailed` with no `nextModel`) has `callInputTokens`, `callOutputTokens` and `callCostMicroUsd`: the sum of all `attempts` documents of the call. An attempt with no document (refused before the reserve, not in the catalog, cancelled before the start) costs 0. An event with a `nextModel` has no totals.                                                                                                                                                                                                    |
 
 Cost of an attempt:
 
@@ -65,6 +69,40 @@ Cost of an attempt:
 `CallCompleted.text` has no NUL and at most 100,000 characters. The full
 text is in the call body.
 
+`kind` and `subtaskId` of `CallRequested` are not used. No `llm.*` event
+has these fields, so ai-proxy copies them nowhere.
+
+## Cancel
+
+The durable consumer `ai-proxy-cancel` on `ORCHESTRATION` reads only
+`orchestration.CallCancelRequested`. The two consumers keep no order
+between them, so a cancel can come before, during or after its call.
+
+```
+CallCancelRequested --> store callId in cancels --> abort the call, if it runs in this pod
+CallRequested, before each attempt --> callId in cancels?
+  yes --> settle a stored reservation with 0 --> CallFailed cancelled, cost 0, no reserve
+running call, at each heartbeat (10 s) --> callId in cancels? yes --> abort
+```
+
+| Case                                   | Result                                                                                                                                                                                                                                                                                            |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| The call runs in this pod              | The cancel handler aborts it at once. The attempt ends with `CallFailed` `cancelled`, no `nextModel`. The cost follows the cost table: `usage` when the stream had it, the reserved amount when the request was sent, 0 when no request was sent. The settle books that cost.                     |
+| The call runs in another pod           | The running pod reads `cancels` at each heartbeat (each 10 s, the same timer as `heartbeatAt`) and aborts the call. Then the same as above. The call can run up to 10 s more.                                                                                                                     |
+| The call has not come yet              | The cancel stays in `cancels`. The later `CallRequested` gets `CallFailed` `cancelled`, cost 0, no reserve and no provider call.                                                                                                                                                                  |
+| The call has ended                     | Nothing. A redelivered `CallRequested` reads the final event first.                                                                                                                                                                                                                               |
+| Between two attempts, or after a crash | A retryable failure of a cancelled call becomes `cancelled` with its own cost and no `nextModel`. A crashed attempt (heartbeat older than 30 s) is booked at the reserved amount as `cancelled`. A cancel that comes after the end event of an attempt stops the next attempt before its reserve. |
+| A cancel during the reserve            | `CallStarted` is appended, the provider gets no request, the settle is 0, and `CallFailed` `cancelled` has cost 0.                                                                                                                                                                                |
+| A stop of the pod at the same time     | As for a stop, the handler saves the body and throws, with the outcome `cancelled` at the reserved amount. The next delivery ends the call as `cancelled` from the body.                                                                                                                          |
+
+A cancel is stored as `{ _id: callId, createdAt }` in `cancels`. The
+handler is idempotent (upsert) and marks nothing as processed. The TTL
+is 45 days, the same as `attempts` and `processed`, so all state of a call
+expires together. A call needs its cancel for at most about 75 minutes
+(15 minutes until the stale rule stops new attempts, plus 59 minutes of
+call time), so 45 days also answers a DLQ replay of an old
+`CallRequested` with `cancelled`. The documents are small.
+
 ## Error classes
 
 | Class            | From                                                                                                                                                                                                                          | Next model |
@@ -74,6 +112,7 @@ text is in the call body.
 | `provider`       | 404 (also "no endpoint" for the `zdr`, `data_collection` or `max_price` rules), 5xx, 529, `provider_unavailable`, `provider_overloaded`, `server`, a network error, a bad chunk, a stream with no end, a crash in the attempt | yes        |
 | `invalid`        | other 4xx (400, 401, 403, 413, 422 ...), a model that is not in the catalog, a price key that is not covered                                                                                                                  | no         |
 | `budget_refused` | budget refusal or no answer, the call limit, 402 (credits, key limit), 403 with a `limit_source`                                                                                                                              | no         |
+| `cancelled`      | `orchestration.CallCancelRequested` for the call (see Cancel)                                                                                                                                                                 | no         |
 
 The `error.metadata.error_type` wins over the HTTP status. A mid-stream
 error (HTTP 200, `finish_reason: "error"`) uses `error.code` (a number or a
@@ -88,6 +127,7 @@ fallback chain runs inside one try.
 ```
 redelivery of CallRequested
   last event is final                         --> nothing
+  callId in cancels, attempt n not started    --> settle a stored reservation with 0, CallFailed cancelled, no provider call
   attempt n started, body stored              --> outcome from the body, settle, end event; no provider call
   attempt n started, no body, heartbeat fresh --> wait until it is 30 s old, then read the stream again
   attempt n started, no body, heartbeat old   --> CallFailed provider, cost = reserved amount, next model
@@ -162,9 +202,24 @@ Environment variables (`.env.example` has all of them):
 | `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | not set                        | Traces go over OTLP only when one is set                             |
 
 The kit service name is `ai-proxy`: the NATS inbox prefix is
-`_INBOX_ai-proxy` and the durable consumer is `ai-proxy` on `ORCHESTRATION`
-with the filter `orchestration.CallRequested` (ADR 0023). The grants of the
-user `ai-systems-ai-proxy` in gitops are complete for this service.
+`_INBOX_ai-proxy`. The durable consumers on `ORCHESTRATION` are `ai-proxy`
+with the filter `orchestration.CallRequested` and `ai-proxy-cancel` with the
+filter `orchestration.CallCancelRequested` (ADR 0023 must change: two
+durables for one service). The DLQ subjects are `dlq.ai-proxy.>` and
+`dlq.ai-proxy-cancel.>`. The user `ai-systems-ai-proxy` in gitops needs
+these grants for the second consumer:
+
+```
+dlq.ai-proxy-cancel.>
+$JS.API.CONSUMER.CREATE.ORCHESTRATION.ai-proxy-cancel.orchestration.CallCancelRequested
+$JS.API.CONSUMER.INFO.ORCHESTRATION.ai-proxy-cancel
+$JS.API.CONSUMER.MSG.NEXT.ORCHESTRATION.ai-proxy-cancel
+$JS.ACK.ORCHESTRATION.ai-proxy-cancel.>
+```
+
+Deploy order: merge these grants before the release of this version.
+Without them the second consumer is not made and `/ready` stays 503, so
+the rollout stops. The grants do nothing for an older version.
 
 ## Mock OpenRouter
 
@@ -178,6 +233,9 @@ OpenRouter.
 
 ## Known limits
 
+- A cancel for a call in another pod waits for the next heartbeat of that
+  pod, up to 10 s. The call streams and costs money until then. Upgrade
+  path: a shorter poll, or a core NATS subject that all pods read.
 - The kit consumer handles the messages of one fetch one after the other,
   so one pod runs one call at a time, up to `maxDurationMs`. This is
   enough for M2 (one agent). Upgrade path: a concurrency option in the
