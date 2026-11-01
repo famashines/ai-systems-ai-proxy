@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Contracts v0.4.1.
+- Second durable consumer `ai-proxy-cancel` on `ORCHESTRATION`, filter
+  `orchestration.CallCancelRequested` (task M3-11). A cancel is stored in
+  `cancels` (TTL 45 days) and aborts the running call in this pod. A call
+  in another pod reads `cancels` at each heartbeat (10 s). The call ends
+  with `CallFailed` `cancelled`, no `nextModel`, at the real cost (usage,
+  the reserved amount when the request was sent, or 0). A `CallRequested`
+  after its cancel gets `CallFailed` `cancelled`, cost 0, no reserve.
+- The final `CallCompleted` or `CallFailed` has `callInputTokens`,
+  `callOutputTokens` and `callCostMicroUsd`, the sum of all attempts in
+  `attempts`. An attempt with a `nextModel` has none.
+- A signal that is aborted before the provider call sends no request and
+  books 0.
+- The gitops grants for `ai-proxy-cancel` must merge before this release.
+
 - A `CallRequested` older than 15 minutes gives `CallFailed` `timeout`
   with no `nextModel`, no reservation and no provider call (task M2-18).
   A stored reservation of that attempt is settled with 0 first.

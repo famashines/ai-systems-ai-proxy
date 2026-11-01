@@ -222,6 +222,7 @@ export function openRouter(options: OpenRouterOptions): LlmProvider {
         ...(response.usage ? { usage: response.usage } : {}),
       });
     };
+    if (input.signal.aborted) return done(aborted(input.signal, false, response));
     let http: Response;
     try {
       http = await fetch(`${base}/chat/completions`, {

@@ -17,6 +17,15 @@ export const indexMigration: Migration = {
   },
 };
 
+export const cancelsMigration: Migration = {
+  name: "002-ai-proxy-cancels",
+  up: async (db) => {
+    await db
+      .collection("cancels")
+      .createIndex({ createdAt: 1 }, { expireAfterSeconds: 45 * 86400 }, undefined);
+  },
+};
+
 export interface Attempt {
   reservationId: string;
   bodyId: string;
@@ -25,10 +34,29 @@ export interface Attempt {
   heartbeatAt?: number;
 }
 
+export interface AttemptCost {
+  inputTokens: number;
+  outputTokens: number;
+  costMicroUsd: number;
+}
+
+export interface CallTotals {
+  callInputTokens: number;
+  callOutputTokens: number;
+  callCostMicroUsd: number;
+}
+
 export interface Attempts {
   ensure(callId: string, attempt: number, init: Omit<Attempt, "heartbeatAt">): Promise<Attempt>;
   beat(callId: string, attempt: number): Promise<void>;
   reservationId(callId: string, attempt: number): Promise<string | undefined>;
+  record(callId: string, attempt: number, cost: AttemptCost): Promise<void>;
+  totals(callId: string): Promise<CallTotals>;
+}
+
+export interface Cancels {
+  add(callId: string): Promise<void>;
+  has(callId: string): Promise<boolean>;
 }
 
 export interface CallBody {
@@ -53,7 +81,8 @@ export interface Catalog {
 
 export function mongoAttempts(db: Db): Attempts {
   const attempts = db.collection<
-    Omit<Attempt, "heartbeatAt"> & { _id: string; createdAt: Date; heartbeatAt?: Date }
+    Omit<Attempt, "heartbeatAt"> &
+      Partial<AttemptCost> & { _id: string; createdAt: Date; heartbeatAt?: Date }
   >("attempts");
   const key = (callId: string, attempt: number): string => `${callId}:${String(attempt)}`;
   return {
@@ -80,6 +109,42 @@ export function mongoAttempts(db: Db): Attempts {
     },
     async reservationId(callId, attempt) {
       return (await attempts.findOne({ _id: key(callId, attempt) }))?.reservationId;
+    },
+    async record(callId, attempt, cost) {
+      await attempts.updateOne({ _id: key(callId, attempt) }, { $set: cost });
+    },
+    async totals(callId) {
+      const [sum] = await attempts
+        .aggregate<CallTotals>([
+          { $match: { _id: { $regex: `^${callId}:` } } },
+          {
+            $group: {
+              _id: null,
+              callInputTokens: { $sum: "$inputTokens" },
+              callOutputTokens: { $sum: "$outputTokens" },
+              callCostMicroUsd: { $sum: "$costMicroUsd" },
+            },
+          },
+          { $project: { _id: 0 } },
+        ])
+        .toArray();
+      return sum ?? { callInputTokens: 0, callOutputTokens: 0, callCostMicroUsd: 0 };
+    },
+  };
+}
+
+export function mongoCancels(db: Db): Cancels {
+  const cancels = db.collection<{ _id: string; createdAt: Date }>("cancels");
+  return {
+    async add(callId) {
+      await cancels.updateOne(
+        { _id: callId },
+        { $setOnInsert: { createdAt: new Date() } },
+        { upsert: true },
+      );
+    },
+    async has(callId) {
+      return (await cancels.countDocuments({ _id: callId }, { limit: 1 })) > 0;
     },
   };
 }

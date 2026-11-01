@@ -19,11 +19,19 @@ import { connectMongo, runMigrations } from "@famashines/ai-systems-kit/mongo";
 import { createLogger, startTelemetry } from "@famashines/ai-systems-kit/observability";
 import { z } from "zod";
 import { routes } from "./adapters/http.ts";
-import { catalog, indexMigration, mongoAttempts, mongoBodies } from "./adapters/mongo.ts";
+import {
+  cancelsMigration,
+  catalog,
+  indexMigration,
+  mongoAttempts,
+  mongoBodies,
+  mongoCancels,
+} from "./adapters/mongo.ts";
 import { openRouter } from "./adapters/openrouter.ts";
-import { handleCallRequested } from "./application/handle-call.ts";
+import { handleCallCancelRequested, handleCallRequested } from "./application/handle-call.ts";
 
 export const service = "ai-proxy";
+const cancelDurable = "ai-proxy-cancel";
 
 export const envSchema = commonEnv.omit({ SERVICE_NAME: true }).extend({
   MONGODB_URI: z.string().min(1),
@@ -68,7 +76,7 @@ export async function start(config: Readonly<Config>, options: { drainDelayMs?: 
     database: config.MONGODB_DATABASE,
     clientOptions: { serverSelectionTimeoutMS: 5000 },
   });
-  const migrations = [eventStoreMigration, processedMigration, indexMigration];
+  const migrations = [eventStoreMigration, processedMigration, indexMigration, cancelsMigration];
   await runMigrations(mongo.db, migrations);
   const store = createEventStore(mongo.db);
   logger.info("connecting to NATS");
@@ -90,6 +98,8 @@ export async function start(config: Readonly<Config>, options: { drainDelayMs?: 
     store,
     attempts: mongoAttempts(mongo.db),
     bodies: mongoBodies(mongo.db),
+    cancels: mongoCancels(mongo.db),
+    calls: new Map<string, AbortController>(),
     catalog: catalog({ db: mongo.db, fetchModels: () => provider.models(), logger }),
     budget: {
       reserve: (input: ReserveFundsRequestV1) =>
@@ -122,6 +132,17 @@ export async function start(config: Readonly<Config>, options: { drainDelayMs?: 
       }
     },
   });
+  const cancelConsumer = startConsumer({
+    nats: { ...nats, service: cancelDurable },
+    db: mongo.db,
+    stream: "ORCHESTRATION",
+    filter: "orchestration.CallCancelRequested",
+    handler: async (event) => {
+      if (event.type === "orchestration.CallCancelRequested") {
+        await handleCallCancelRequested(deps, event);
+      }
+    },
+  });
   const app = createService({
     logger,
     routes: routes({ store }),
@@ -133,6 +154,7 @@ export async function start(config: Readonly<Config>, options: { drainDelayMs?: 
           .countDocuments({ _id: { $in: migrations.map((migration) => migration.name) } })) ===
         migrations.length,
       consumer: consumer.ready,
+      cancelConsumer: cancelConsumer.ready,
     },
     metrics: telemetry.metricsHandler,
     closeHooks: [
@@ -141,7 +163,7 @@ export async function start(config: Readonly<Config>, options: { drainDelayMs?: 
       nats.close,
       relay.close,
       async () => {
-        const closing = consumer.close();
+        const closing = Promise.all([consumer.close(), cancelConsumer.close()]);
         stop.abort();
         await closing;
       },

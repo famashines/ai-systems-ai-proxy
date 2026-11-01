@@ -211,6 +211,22 @@ test("a timeout before the response headers is committed, because the request wa
   });
 });
 
+test("a signal that is aborted before the call sends no request and is not committed", async () => {
+  const before = mock.received.length;
+  const stop = new AbortController();
+  stop.abort();
+  const { result } = await call("mock/k", stop.signal).done;
+  assert.equal(mock.received.length, before);
+  assert.deepEqual(result, {
+    ok: false,
+    errorClass: "timeout",
+    reason: "OpenRouter did not end the call in time (timeout)",
+    committed: false,
+    aborted: true,
+    text: "",
+  });
+});
+
 test("a socket reset after the request is sent is committed", async () => {
   mock.reply("mock/reset", { kind: "reset" });
   const { result } = await call("mock/reset").done;

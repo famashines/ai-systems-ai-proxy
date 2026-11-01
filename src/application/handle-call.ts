@@ -1,6 +1,7 @@
 import { setTimeout as sleep } from "node:timers/promises";
 import {
   deltaSubject,
+  type CallCancelRequestedEventPayloadV1,
   type CallRequestedEventPayloadV1,
   type DeltaV1,
   type EventEnvelopeV1,
@@ -11,10 +12,12 @@ import {
 } from "@famashines/ai-systems-contracts";
 import type { EventStore } from "@famashines/ai-systems-kit/event-store";
 import type { HandlerContext } from "@famashines/ai-systems-kit/messaging";
-import type { Attempt, Attempts, Bodies, Catalog, Logger } from "../adapters/mongo.ts";
+import type { Attempt, Attempts, Bodies, Cancels, Catalog, Logger } from "../adapters/mongo.ts";
 import type { LlmProvider } from "../adapters/openrouter.ts";
 import {
   callStreamId,
+  cancelled,
+  cancelReason,
   cleanText,
   evolve,
   initialState,
@@ -38,6 +41,8 @@ export interface Deps {
   store: EventStore;
   attempts: Attempts;
   bodies: Bodies;
+  cancels: Cancels;
+  calls: Map<string, AbortController>;
   catalog: Catalog;
   budget: Budget;
   provider: LlmProvider;
@@ -52,6 +57,11 @@ export interface Deps {
 export type CallRequested = EventEnvelopeV1 & {
   type: "orchestration.CallRequested";
   payload: CallRequestedEventPayloadV1;
+};
+
+export type CallCancelRequested = EventEnvelopeV1 & {
+  type: "orchestration.CallCancelRequested";
+  payload: CallCancelRequestedEventPayloadV1;
 };
 
 export class StoppingError extends Error {
@@ -71,12 +81,36 @@ export const staleAfterMs = 15 * 60_000;
 export const staleReason = "The request is older than 15 minutes, so the call stops";
 const saveTries = 3;
 
+export async function handleCallCancelRequested(
+  deps: Pick<Deps, "cancels" | "calls">,
+  event: CallCancelRequested,
+): Promise<void> {
+  await deps.cancels.add(event.payload.callId);
+  deps.calls.get(event.payload.callId)?.abort();
+}
+
 export async function handleCallRequested(
   deps: Deps,
   event: CallRequested,
-  { markProcessed }: Pick<HandlerContext, "markProcessed">,
+  context: Pick<HandlerContext, "markProcessed">,
 ): Promise<void> {
   if (stopped(deps)) throw new StoppingError();
+  const { callId } = event.payload;
+  const cancel = new AbortController();
+  deps.calls.set(callId, cancel);
+  try {
+    await runCall(deps, event, context, cancel);
+  } finally {
+    if (deps.calls.get(callId) === cancel) deps.calls.delete(callId);
+  }
+}
+
+async function runCall(
+  deps: Deps,
+  event: CallRequested,
+  { markProcessed }: Pick<HandlerContext, "markProcessed">,
+  cancel: AbortController,
+): Promise<void> {
   const { store } = deps;
   const call = event.payload;
   const durationMs = Math.min(call.maxDurationMs, maxCallMs);
@@ -97,6 +131,8 @@ export async function handleCallRequested(
 
   const append = async (events: CallEvent[]): Promise<void> => {
     const final = events.reduce(evolve, state).final;
+    const last = events.at(-1);
+    if (final && last) Object.assign(last.payload, await deps.attempts.totals(call.callId));
     await store.append({
       streamId,
       expectedVersion: version,
@@ -137,7 +173,7 @@ export async function handleCallRequested(
 
   const fail = (
     attempt: number,
-    errorClass: "invalid" | "provider" | "timeout",
+    errorClass: "invalid" | "provider" | "timeout" | "cancelled",
     reason: string,
     reservationId?: string,
   ) =>
@@ -184,10 +220,13 @@ export async function handleCallRequested(
   }
 
   async function run(attempt: number): Promise<Done | undefined> {
-    if (deps.now() - Date.parse(event.occurredAt) > staleAfterMs) {
+    const cancelledCall = await deps.cancels.has(call.callId);
+    if (cancelledCall || deps.now() - Date.parse(event.occurredAt) > staleAfterMs) {
       const held = await deps.attempts.reservationId(call.callId, attempt);
       if (held !== undefined) await settleQuietly(held);
-      await fail(attempt, "timeout", staleReason, held);
+      await (cancelledCall
+        ? fail(attempt, "cancelled", cancelReason, held)
+        : fail(attempt, "timeout", staleReason, held));
       return undefined;
     }
     const { model } = base(attempt);
@@ -255,10 +294,19 @@ export async function handleCallRequested(
     ]);
     let i = 0;
     const started = deps.now();
+    if (await deps.cancels.has(call.callId).catch(() => false)) cancel.abort();
     const beat = (): void => {
       deps.attempts.beat(call.callId, attempt).catch((error: unknown) => {
         deps.logger.warn({ error: (error as Error).name }, "the attempt heartbeat failed");
       });
+      deps.cancels.has(call.callId).then(
+        (found) => {
+          if (found) cancel.abort();
+        },
+        (error: unknown) => {
+          deps.logger.warn({ error: (error as Error).name }, "the cancel check failed");
+        },
+      );
     };
     beat();
     const heartbeat = setInterval(beat, deps.heartbeatMs ?? heartbeatMs);
@@ -268,7 +316,7 @@ export async function handleCallRequested(
         messages: call.messages,
         maxTokens: call.maxTokens,
         maxPrice: stored.maxPrice,
-        signal: AbortSignal.any([AbortSignal.timeout(durationMs), deps.stopping]),
+        signal: AbortSignal.any([AbortSignal.timeout(durationMs), deps.stopping, cancel.signal]),
         onDelta: (text) => {
           for (const part of splitDelta(cleanText(text))) {
             deps.publish(deltaSubject(call.taskId, call.callId), { attempt, i, text: part });
@@ -279,10 +327,12 @@ export async function handleCallRequested(
       .finally(() => {
         clearInterval(heartbeat);
       });
-    const stopping = stopped(deps) && !result.ok && result.aborted === true;
-    const outcome = stopping
+    const aborted = !result.ok && result.aborted === true;
+    const stopping = aborted && stopped(deps);
+    const ended = stopping
       ? interrupted(stored.amountMicroUsd)
       : outcomeOf(result, entry, stored.amountMicroUsd, deps.now() - started);
+    const outcome = aborted && cancel.signal.aborted ? cancelled(ended) : ended;
     const body = {
       _id: stored.bodyId,
       callId: call.callId,
@@ -337,8 +387,20 @@ export async function handleCallRequested(
     }
   }
 
-  async function finish(attempt: number, { entry, outcome, stored }: Done): Promise<void> {
-    await settle(entry, outcome);
+  async function finish(attempt: number, done: Done): Promise<void> {
+    const { entry, stored } = done;
+    await settle(entry, done.outcome);
+    await deps.attempts.record(call.callId, attempt, {
+      inputTokens: done.outcome.inputTokens ?? 0,
+      outputTokens: done.outcome.outputTokens ?? 0,
+      costMicroUsd: done.outcome.costMicroUsd,
+    });
+    const outcome =
+      "errorClass" in done.outcome &&
+      retryable(done.outcome.errorClass) &&
+      (await deps.cancels.has(call.callId))
+        ? cancelled(done.outcome)
+        : done.outcome;
     if (!("errorClass" in outcome)) {
       await append([
         {
@@ -367,7 +429,7 @@ export async function handleCallRequested(
     const step = nextStep(state, call.models.length);
     if (step.kind === "done") return;
     const done = step.kind === "resume" ? await resume(step.attempt) : await run(step.attempt);
-    if (done === "again") return handleCallRequested(deps, event, { markProcessed });
+    if (done === "again") return runCall(deps, event, { markProcessed }, cancel);
     if (done) await finish(step.attempt, done);
   }
 }

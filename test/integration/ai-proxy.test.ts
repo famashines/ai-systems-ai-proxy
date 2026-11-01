@@ -42,6 +42,11 @@ const aiProxyGrants = [
   "$JS.API.CONSUMER.INFO.ORCHESTRATION.ai-proxy",
   "$JS.API.CONSUMER.MSG.NEXT.ORCHESTRATION.ai-proxy",
   "$JS.ACK.ORCHESTRATION.ai-proxy.>",
+  "dlq.ai-proxy-cancel.>",
+  "$JS.API.CONSUMER.CREATE.ORCHESTRATION.ai-proxy-cancel.orchestration.CallCancelRequested",
+  "$JS.API.CONSUMER.INFO.ORCHESTRATION.ai-proxy-cancel",
+  "$JS.API.CONSUMER.MSG.NEXT.ORCHESTRATION.ai-proxy-cancel",
+  "$JS.ACK.ORCHESTRATION.ai-proxy-cancel.>",
 ];
 
 const budgetGrants = ["budget.>", "dlq.budget.>", "$JS.API.INFO", "$JS.API.STREAM.INFO.BUDGET"];
@@ -198,9 +203,13 @@ after(async () => {
   await Promise.all([mongoContainer.stop(), natsContainer.stop()]);
 });
 
-const envelope = (payload: Record<string, unknown>, taskId: string) => ({
+const envelope = (
+  payload: Record<string, unknown>,
+  taskId: string,
+  type = "orchestration.CallRequested",
+) => ({
   eventId: randomUUID(),
-  type: "orchestration.CallRequested",
+  type,
   schemaVersion: 1,
   streamId: `task-${taskId}`,
   version: 2,
@@ -211,13 +220,14 @@ const envelope = (payload: Record<string, unknown>, taskId: string) => ({
   payload,
 });
 
-const publish = async (event: { eventId: string }, msgId = event.eventId) => {
-  await jetstream(admin.connection).publish("orchestration.CallRequested", JSON.stringify(event), {
-    msgID: msgId,
-  });
+const publish = async (event: { eventId: string; type: string }, msgId = event.eventId) => {
+  await jetstream(admin.connection).publish(event.type, JSON.stringify(event), { msgID: msgId });
 };
 
-const callRequest = (models: string[]) => {
+const cancelOf = (taskId: string, callId: string) =>
+  envelope({ taskId, callId }, taskId, "orchestration.CallCancelRequested");
+
+const callRequest = (models: string[], extra: Record<string, unknown> = {}) => {
   const taskId = randomUUID();
   const callId = randomUUID();
   const event = envelope(
@@ -230,6 +240,7 @@ const callRequest = (models: string[]) => {
       models,
       maxTokens: 50,
       maxDurationMs: 30_000,
+      ...extra,
     },
     taskId,
   );
@@ -329,6 +340,18 @@ test("a rate limit goes to the next model with a new reservation", async () => {
     "llm.CallStarted",
     "llm.CallCompleted",
   ]);
+  const stored = await events()
+    .find({ streamId: `call-${callId}` }, { sort: { version: 1 } })
+    .toArray();
+  assert.equal("callCostMicroUsd" in (stored[1]?.payload ?? {}), false);
+  assert.deepEqual(
+    [
+      stored[3]?.payload.callInputTokens,
+      stored[3]?.payload.callOutputTokens,
+      stored[3]?.payload.callCostMicroUsd,
+    ],
+    [10, 1, 42],
+  );
   const mine = reserves.filter((item) => item.taskId === taskId);
   assert.equal(mine.length, 2);
   assert.notEqual(mine[0]?.reservationId, mine[1]?.reservationId);
@@ -370,4 +393,66 @@ test("the replay API gives the llm events", async () => {
   const { events: all } = (await response.json()) as { events: { type: string }[] };
   assert.ok(all.length >= 9);
   assert.ok(all.every((event) => event.type.startsWith("llm.")));
+});
+
+const payloads = async (callId: string) =>
+  (
+    await events()
+      .find({ streamId: `call-${callId}` }, { sort: { version: 1 } })
+      .toArray()
+  ).map((event) => event.payload);
+
+test("a cancel stops a running call with cancelled and no next model", async () => {
+  mock.reply("mock/small", { kind: "hang" });
+  const { taskId, callId, event } = callRequest(["mock/small", "mock/large"], {
+    kind: "subtask",
+    subtaskId: randomUUID(),
+  });
+  const calls = mock.received.length;
+  await publish(event);
+  await waitFor(() => mock.received.length > calls);
+  await publish(cancelOf(taskId, callId));
+  await ended(callId, 2);
+  const [, failed] = await payloads(callId);
+  const reserve = reserves.find((item) => item.taskId === taskId);
+  assert.ok(failed && reserve);
+  assert.equal(failed.errorClass, "cancelled");
+  assert.equal("nextModel" in failed, false);
+  assert.equal(failed.costMicroUsd, reserve.amountMicroUsd);
+  assert.equal(failed.callCostMicroUsd, reserve.amountMicroUsd);
+  assert.deepEqual(
+    settles.filter((item) => item.reservationId === reserve.reservationId),
+    [{ reservationId: reserve.reservationId, actualMicroUsd: reserve.amountMicroUsd }],
+  );
+});
+
+test("a cancel that comes first answers the later CallRequested with no reserve", async () => {
+  const { taskId, callId, event } = callRequest(["mock/small"]);
+  await publish(cancelOf(taskId, callId));
+  await waitFor(
+    async () =>
+      (await mongo.db.collection<{ _id: string }>("cancels").countDocuments({ _id: callId })) === 1,
+  );
+  const calls = mock.received.length;
+  await publish(event);
+  await ended(callId, 1);
+  const [failed] = await payloads(callId);
+  assert.ok(failed);
+  assert.equal(failed.errorClass, "cancelled");
+  assert.equal(failed.costMicroUsd, 0);
+  assert.equal(failed.callCostMicroUsd, 0);
+  assert.equal(reserves.filter((item) => item.taskId === taskId).length, 0);
+  assert.equal(mock.received.length, calls);
+});
+
+test("a cancel stored by another pod stops the call at the next heartbeat", async () => {
+  mock.reply("mock/small", { kind: "hang" });
+  const { callId, event } = callRequest(["mock/small"]);
+  await publish(event);
+  await waitFor(async () => (await typesOf(callId)).length === 1);
+  await mongo.db
+    .collection<{ _id: string; createdAt: Date }>("cancels")
+    .insertOne({ _id: callId, createdAt: new Date() });
+  await ended(callId, 2);
+  assert.equal((await payloads(callId))[1]?.errorClass, "cancelled");
 });
