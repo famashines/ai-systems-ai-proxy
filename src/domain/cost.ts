@@ -12,6 +12,7 @@ export const Pricing = z.looseObject({
   input_cache_write: Price.optional(),
   input_cache_write_1h: Price.optional(),
   input_cache_read: Price.optional(),
+  web_search: Price.optional(),
   overrides: z.array(z.record(z.string(), z.unknown())).max(50).optional(),
 });
 export type Pricing = z.infer<typeof Pricing>;
@@ -37,6 +38,7 @@ const priceKeys = [
   "input_cache_write",
   "input_cache_write_1h",
   "input_cache_read",
+  "web_search",
 ] as const;
 type PriceKey = (typeof priceKeys)[number];
 
@@ -93,7 +95,7 @@ export function prices(pricing: Pricing): Record<PriceKey, bigint> {
 const rates = (pricing: Pricing) => {
   const p = prices(pricing);
   return {
-    request: p.request,
+    request: p.request + p.web_search,
     input: max([p.prompt, p.input_cache_write, p.input_cache_write_1h, p.input_cache_read]),
     output: max([p.completion, p.internal_reasoning]),
   };
