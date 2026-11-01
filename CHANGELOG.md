@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- A `CallRequested` older than 15 minutes gives `CallFailed` `invalid`
+  with no reservation and no provider call (task M2-18).
+- The interrupted outcome is booked only when the stop aborts the call. A
+  provider failure at the same time as a stop keeps its class, so an
+  `invalid` does not go to the next model.
+
 ## 0.1.0
 
 - Durable consumer `ai-proxy` on `ORCHESTRATION`, filter

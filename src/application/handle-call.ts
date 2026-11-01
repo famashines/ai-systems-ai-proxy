@@ -67,6 +67,9 @@ export const reserveMarginMs = 60_000;
 export const maxCallMs = 3_540_000;
 export const heartbeatMs = 10_000;
 export const heartbeatStaleMs = 30_000;
+export const staleAfterMs = 15 * 60_000;
+export const staleReason =
+  "The request is older than 15 minutes, so no model was called: orchestration does not show a late answer";
 const saveTries = 3;
 
 export async function handleCallRequested(
@@ -171,6 +174,10 @@ export async function handleCallRequested(
   }
 
   async function run(attempt: number): Promise<Done | undefined> {
+    if (deps.now() - Date.parse(event.occurredAt) > staleAfterMs) {
+      await fail(attempt, "invalid", staleReason);
+      return undefined;
+    }
     const { model } = base(attempt);
     const entry = await deps.catalog.model(model);
     if (typeof entry === "string") {
@@ -260,7 +267,7 @@ export async function handleCallRequested(
       .finally(() => {
         clearInterval(heartbeat);
       });
-    const stopping = stopped(deps) && !result.ok;
+    const stopping = stopped(deps) && !result.ok && result.aborted === true;
     const outcome = stopping
       ? interrupted(stored.amountMicroUsd)
       : outcomeOf(result, entry, stored.amountMicroUsd, deps.now() - started);
