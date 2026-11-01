@@ -408,8 +408,9 @@ test("a cancel stops a running call with cancelled and no next model", async () 
     kind: "subtask",
     subtaskId: randomUUID(),
   });
+  const calls = mock.received.length;
   await publish(event);
-  await waitFor(async () => (await typesOf(callId)).length === 1);
+  await waitFor(() => mock.received.length > calls);
   await publish(cancelOf(taskId, callId));
   await ended(callId, 2);
   const [, failed] = await payloads(callId);
