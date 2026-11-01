@@ -130,6 +130,11 @@ export const interrupted = (reservedMicroUsd: number): Outcome => ({
   costMicroUsd: reservedMicroUsd,
 });
 
+export const cancelReason = "The call was cancelled";
+
+export const cancelled = (outcome: Outcome): Outcome =>
+  "errorClass" in outcome ? { ...outcome, errorClass: "cancelled", reason: cancelReason } : outcome;
+
 export const deltaChars = 16_384;
 
 export function splitDelta(text: string): string[] {

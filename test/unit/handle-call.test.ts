@@ -8,16 +8,18 @@ import type {
 } from "@famashines/ai-systems-contracts";
 import { UnavailableError } from "@famashines/ai-systems-kit/http";
 import { createLogger } from "@famashines/ai-systems-kit/observability";
-import { createMemoryEventStore, fakeIds } from "@famashines/ai-systems-kit/testing";
-import type { Attempt, CallBody } from "../../src/adapters/mongo.ts";
+import { createMemoryEventStore, fakeIds, waitFor } from "@famashines/ai-systems-kit/testing";
+import type { Attempt, AttemptCost, CallBody } from "../../src/adapters/mongo.ts";
 import { openRouter, type LlmProvider } from "../../src/adapters/openrouter.ts";
-import { interrupted } from "../../src/domain/call.ts";
+import { cancelReason, interrupted } from "../../src/domain/call.ts";
 import {
+  handleCallCancelRequested,
   handleCallRequested,
   heartbeatStaleMs,
   staleAfterMs,
   staleReason,
   StoppingError,
+  type CallCancelRequested,
   type CallRequested,
   type Deps,
 } from "../../src/application/handle-call.ts";
@@ -27,9 +29,11 @@ import {
   startMockOpenRouter,
   streamError,
   streamOf,
+  usage,
   type MockOpenRouter,
 } from "../mock-openrouter.ts";
 
+const zeroTotals = { callInputTokens: 0, callOutputTokens: 0, callCostMicroUsd: 0 };
 const logger = createLogger({ service: "test", release: "test", level: "silent" });
 const taskId = "10000000-0000-4000-8000-000000000001";
 const callId = "10000000-0000-4000-8000-000000000002";
@@ -69,9 +73,11 @@ beforeEach(() => {
   world = setup();
 });
 
-function setup(options: { provider?: LlmProvider } = {}) {
+function setup(options: { provider?: LlmProvider; cancels?: Set<string> } = {}) {
   const store = createMemoryEventStore();
-  const attempts = new Map<string, Attempt>();
+  const attempts = new Map<string, Attempt & Partial<AttemptCost>>();
+  const cancels = options.cancels ?? new Set<string>();
+  const calls = new Map<string, AbortController>();
   const bodies = new Map<string, CallBody>();
   const reserves: ReserveFundsRequestV1[] = [];
   const settles: SettleReservationRequestV1[] = [];
@@ -106,7 +112,29 @@ function setup(options: { provider?: LlmProvider } = {}) {
       },
       reservationId: (id, attempt) =>
         Promise.resolve(attempts.get(`${id}:${String(attempt)}`)?.reservationId),
+      record: (id, attempt, cost) => {
+        Object.assign(attempts.get(`${id}:${String(attempt)}`) ?? {}, cost);
+        return Promise.resolve();
+      },
+      totals: (id) => {
+        const mine = [...attempts].filter(([key]) => key.startsWith(`${id}:`));
+        const sum = (pick: (entry: Partial<AttemptCost>) => number | undefined) =>
+          mine.reduce((total, [, entry]) => total + (pick(entry) ?? 0), 0);
+        return Promise.resolve({
+          callInputTokens: sum((entry) => entry.inputTokens),
+          callOutputTokens: sum((entry) => entry.outputTokens),
+          callCostMicroUsd: sum((entry) => entry.costMicroUsd),
+        });
+      },
     },
+    cancels: {
+      add: (id) => {
+        cancels.add(id);
+        return Promise.resolve();
+      },
+      has: (id) => Promise.resolve(cancels.has(id)),
+    },
+    calls,
     bodies: {
       save: (body) => {
         if (budget.saveFails > 0) {
@@ -162,6 +190,8 @@ function setup(options: { provider?: LlmProvider } = {}) {
     events,
     attempts,
     bodies,
+    cancels,
+    calls,
     reserves,
     settles,
     deltas,
@@ -326,6 +356,7 @@ test("a budget refusal gives budget_refused and no provider call", async () => {
         errorClass: "budget_refused",
         reason: "Monthly cap reached",
         costMicroUsd: 0,
+        ...zeroTotals,
         reservationId: world.reserves[0]?.reservationId,
       },
     },
@@ -734,6 +765,7 @@ test("a request older than 15 minutes makes no reservation and no provider call"
         errorClass: "timeout",
         reason: staleReason,
         costMicroUsd: 0,
+        ...zeroTotals,
       },
     },
   ]);
@@ -814,4 +846,209 @@ test("a provider failure at the same time as a stop keeps its class and goes to 
     [0],
   );
   assert.equal(racing.marked.length, 1);
+});
+
+const cancelRequest = (id = callId): CallCancelRequested => ({
+  eventId: "10000000-0000-4000-8000-0000000000cc",
+  type: "orchestration.CallCancelRequested",
+  schemaVersion: 1,
+  streamId: `task-${taskId}`,
+  version: 9,
+  occurredAt: new Date().toISOString(),
+  correlationId: taskId,
+  causationId: "10000000-0000-4000-8000-0000000000dd",
+  actor: { kind: "system", id: "orchestration" },
+  payload: { taskId, callId: id },
+});
+
+const cancelOf = (target: ReturnType<typeof setup>) =>
+  handleCallCancelRequested(target.deps, cancelRequest());
+
+test("a cancel of a running call aborts it with cancelled, the reserved amount and no next model", async () => {
+  mock.reply("mock/small", { kind: "hang" });
+  const running = world.handle(request());
+  await waitFor(() => mock.received.length === 1);
+  const started = Date.now();
+  await cancelOf(world);
+  await running;
+  assert.ok(Date.now() - started < 1000);
+  const events = await world.events();
+  const reserved = world.reserves[0]?.amountMicroUsd ?? -1;
+  assert.deepEqual(
+    events.map((event) => event.type),
+    ["llm.CallStarted", "llm.CallFailed"],
+  );
+  const failed = events[1]?.payload ?? {};
+  assert.equal(failed.errorClass, "cancelled");
+  assert.equal(failed.reason, cancelReason);
+  assert.equal(failed.costMicroUsd, reserved);
+  assert.equal("nextModel" in failed, false);
+  assert.equal(failed.callCostMicroUsd, reserved);
+  assert.deepEqual(world.settles, [
+    { reservationId: world.reserves[0]?.reservationId, actualMicroUsd: reserved },
+  ]);
+  assert.deepEqual([...world.bodies.values()][0]?.outcome, {
+    errorClass: "cancelled",
+    reason: cancelReason,
+    costMicroUsd: reserved,
+  });
+  assert.equal(mock.received.length, 1);
+  assert.equal(world.calls.size, 0);
+  assert.equal(world.marked.length, 1);
+});
+
+test("a cancel after the usage chunk books the real cost of the stream", async () => {
+  mock.reply("mock/small", {
+    kind: "stream",
+    events: [
+      { choices: [], usage: usage(10, 3, 0.000017) },
+      { choices: [{ delta: { content: "Part" }, finish_reason: null }] },
+    ],
+    hold: true,
+  });
+  const running = world.handle(request());
+  await waitFor(() => world.deltas.length === 1);
+  await cancelOf(world);
+  await running;
+  const failed = (await world.events())[1]?.payload ?? {};
+  assert.equal(failed.errorClass, "cancelled");
+  assert.equal(failed.costMicroUsd, 17);
+  assert.equal(failed.inputTokens, 10);
+  assert.deepEqual(
+    [failed.callInputTokens, failed.callOutputTokens, failed.callCostMicroUsd],
+    [10, 3, 17],
+  );
+  assert.equal(world.settles[0]?.actualMicroUsd, 17);
+});
+
+test("a cancel that comes before its CallRequested ends the call with cost 0 and no reserve", async () => {
+  await cancelOf(world);
+  await world.handle(request());
+  assert.deepEqual(await world.events(), [
+    {
+      type: "llm.CallFailed",
+      payload: {
+        taskId,
+        callId,
+        attempt: 1,
+        model: "mock/small",
+        errorClass: "cancelled",
+        reason: cancelReason,
+        costMicroUsd: 0,
+        ...zeroTotals,
+      },
+    },
+  ]);
+  assert.equal(world.reserves.length, 0);
+  assert.equal(world.settles.length, 0);
+  assert.equal(mock.received.length, 0);
+  assert.equal(world.marked.length, 1);
+});
+
+test("a cancel of a call that has ended does nothing", async () => {
+  await world.handle(request());
+  const before = await world.events();
+  await cancelOf(world);
+  await world.handle(request());
+  assert.deepEqual(await world.events(), before);
+  assert.equal(before.at(-1)?.type, "llm.CallCompleted");
+  assert.equal(mock.received.length, 1);
+});
+
+test("a call in another pod learns the stored cancel at its next heartbeat", async () => {
+  const shared = new Set<string>();
+  const podA = setup({ cancels: shared });
+  const podB = setup({ cancels: shared });
+  podA.deps.heartbeatMs = 50;
+  mock.reply("mock/small", { kind: "hang" });
+  const running = podA.handle(request());
+  await waitFor(() => mock.received.length === 1);
+  const started = Date.now();
+  await cancelOf(podB);
+  assert.equal(podB.calls.size, 0);
+  await running;
+  assert.ok(Date.now() - started < 1000);
+  const events = await podA.events();
+  assert.deepEqual(
+    events.map((event) => event.payload.errorClass ?? event.type),
+    ["llm.CallStarted", "cancelled"],
+  );
+  assert.equal("nextModel" in (events[1]?.payload ?? {}), false);
+  assert.equal(mock.received.length, 1);
+});
+
+test("a cancel during the reserve settles 0 and calls no provider", async () => {
+  const { reply } = world.budget;
+  world.budget.reply = async (input) => {
+    await cancelOf(world);
+    return reply(input);
+  };
+  await world.handle(request());
+  const events = await world.events();
+  assert.deepEqual(
+    events.map((event) => event.payload.errorClass ?? event.type),
+    ["llm.CallStarted", "cancelled"],
+  );
+  assert.equal(events[1]?.payload.costMicroUsd, 0);
+  assert.equal(world.settles[0]?.actualMicroUsd, 0);
+  assert.equal(mock.received.length, 0);
+});
+
+test("a cancelled call that crashed in the stream ends as cancelled with no next model", async () => {
+  const crashing = setup({
+    provider: {
+      complete: () => Promise.reject(new Error("crash in the stream")),
+      models: () => Promise.resolve([]),
+    },
+  });
+  await assert.rejects(crashing.handle(request()), /crash/);
+  await cancelOf(crashing);
+  const deps = { ...crashing.deps, now: () => Date.now() + heartbeatStaleMs + 1000 };
+  await handleCallRequested(deps, request(), { markProcessed: () => Promise.resolve() });
+  const events = await crashing.events();
+  assert.deepEqual(
+    events.map((event) => event.payload.errorClass ?? event.type),
+    ["llm.CallStarted", "cancelled"],
+  );
+  assert.equal(events[1]?.payload.costMicroUsd, crashing.reserves[0]?.amountMicroUsd);
+  assert.equal("nextModel" in (events[1]?.payload ?? {}), false);
+});
+
+test("the final event has the totals of all attempts; an attempt with a next model has none", async () => {
+  mock.reply("mock/small", streamError("mock/small", [], { code: 502, message: "down" }));
+  mock.reply("mock/large", streamOf("mock/large", ["One", "Two"]));
+  await world.handle(request());
+  const events = await world.events();
+  const failed = events[1]?.payload ?? {};
+  const completed = events[3]?.payload ?? {};
+  assert.equal(failed.nextModel, "mock/large");
+  assert.equal("callCostMicroUsd" in failed, false);
+  assert.equal("callInputTokens" in failed, false);
+  const first = failed.costMicroUsd as number;
+  assert.ok(first > 0);
+  assert.deepEqual(
+    [completed.callInputTokens, completed.callOutputTokens, completed.callCostMicroUsd],
+    [10, 2, first + 42],
+  );
+});
+
+test("a final CallFailed has the totals of the earlier attempts", async () => {
+  mock.reply("mock/small", streamError("mock/small", [], { code: 502, message: "down" }));
+  mock.reply("mock/large", errorReply(400));
+  await world.handle(request());
+  const events = await world.events();
+  const last = events.at(-1)?.payload ?? {};
+  assert.equal(last.errorClass, "invalid");
+  assert.equal(last.callCostMicroUsd, events[1]?.payload.costMicroUsd);
+  assert.equal(last.callInputTokens, 0);
+});
+
+test("a CallRequested with a kind and a subtaskId runs as before", async () => {
+  await world.handle(
+    request({ kind: "subtask", subtaskId: "10000000-0000-4000-8000-000000000009" }),
+  );
+  assert.deepEqual(
+    (await world.events()).map((event) => event.type),
+    ["llm.CallStarted", "llm.CallCompleted"],
+  );
 });

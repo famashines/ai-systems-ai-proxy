@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  cancelled,
+  cancelReason,
   cleanText,
   deltaChars,
   eventText,
@@ -198,6 +200,25 @@ test("an interrupted attempt books the reserved amount as a provider failure", (
     reason: "The attempt stopped before it ended; the reserved amount is booked",
     costMicroUsd: 55,
   });
+});
+
+test("cancelled changes the class and reason of a failure and keeps a completion", () => {
+  assert.deepEqual(cancelled({ ...interrupted(55), inputTokens: 3 }), {
+    errorClass: "cancelled",
+    reason: cancelReason,
+    costMicroUsd: 55,
+    inputTokens: 3,
+  });
+  const done = {
+    text: "ok",
+    finishReason: "stop" as const,
+    inputTokens: 1,
+    outputTokens: 1,
+    cachedTokens: 0,
+    costMicroUsd: 2,
+    latencyMs: 3,
+  };
+  assert.equal(cancelled(done), done);
 });
 
 test("a delta is not cut inside a surrogate pair", () => {
