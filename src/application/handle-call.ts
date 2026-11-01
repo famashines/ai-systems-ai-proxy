@@ -294,6 +294,7 @@ async function runCall(
     ]);
     let i = 0;
     const started = deps.now();
+    if (await deps.cancels.has(call.callId).catch(() => false)) cancel.abort();
     const beat = (): void => {
       deps.attempts.beat(call.callId, attempt).catch((error: unknown) => {
         deps.logger.warn({ error: (error as Error).name }, "the attempt heartbeat failed");

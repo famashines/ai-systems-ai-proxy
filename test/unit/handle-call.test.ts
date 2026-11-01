@@ -994,6 +994,32 @@ test("a cancel during the reserve settles 0 and calls no provider", async () => 
   assert.equal(mock.received.length, 0);
 });
 
+test("a cancel stored by another pod during the reserve settles 0 and calls no provider", async () => {
+  const shared = new Set<string>();
+  const podA = setup({ cancels: shared });
+  const podB = setup({ cancels: shared });
+  const { reply } = podA.budget;
+  podA.budget.reply = async (input) => {
+    await cancelOf(podB);
+    return reply(input);
+  };
+  await podA.handle(request());
+  const events = await podA.events();
+  assert.deepEqual(
+    events.map((event) => event.payload.errorClass ?? event.type),
+    ["llm.CallStarted", "cancelled"],
+  );
+  const failed = events[1]?.payload ?? {};
+  assert.equal(failed.costMicroUsd, 0);
+  assert.equal(failed.callCostMicroUsd, 0);
+  assert.equal("nextModel" in failed, false);
+  assert.deepEqual(
+    podA.settles.map((settle) => settle.actualMicroUsd),
+    [0],
+  );
+  assert.equal(mock.received.length, 0);
+});
+
 test("a cancelled call that crashed in the stream ends as cancelled with no next model", async () => {
   const crashing = setup({
     provider: {
