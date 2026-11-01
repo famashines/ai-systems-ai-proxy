@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import {
+  ModelId,
   ReserveFundsReplyV1,
   ReserveFundsRequestV1,
   RpcSubject,
@@ -60,6 +61,22 @@ export const envSchema = commonEnv.omit({ SERVICE_NAME: true }).extend({
     }, "Use https, or http only for localhost and 127.0.0.1")
     .default("https://openrouter.ai/api/v1"),
   OPENROUTER_ZDR: z.enum(["true", "false"]).default("true"),
+  MODEL_LIST: z
+    .string()
+    .default("")
+    .transform((value) =>
+      value
+        .split(",")
+        .map((id) => id.trim())
+        .filter((id) => id !== ""),
+    )
+    .pipe(
+      z.array(
+        z.string().refine((id) => ModelId.safeParse(id).success, {
+          error: (issue) => `Not a model id: ${String(issue.input)}`,
+        }),
+      ),
+    ),
   OTEL_EXPORTER_OTLP_ENDPOINT: z.url().optional(),
   OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: z.url().optional(),
 });
@@ -151,7 +168,7 @@ export async function start(config: Readonly<Config>, options: { drainDelayMs?: 
   });
   const app = createService({
     logger,
-    routes: routes({ store, catalog: models }),
+    routes: routes({ store, catalog: models, modelList: config.MODEL_LIST }),
     readiness: {
       mongo: mongo.ready,
       migrations: async () =>

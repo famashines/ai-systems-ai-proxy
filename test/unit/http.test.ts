@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 import { ModelListResultV1 } from "@famashines/ai-systems-contracts";
 import type { EventStore } from "@famashines/ai-systems-kit/event-store";
+import { ConfigError, loadConfig } from "@famashines/ai-systems-kit/config";
 import { createService } from "@famashines/ai-systems-kit/http";
 import { createLogger } from "@famashines/ai-systems-kit/observability";
 import { createMemoryEventStore } from "@famashines/ai-systems-kit/testing";
@@ -115,6 +116,22 @@ test("the model list has the usable user models sorted by name, and 503 with no 
   assert.equal((await fetch(`${base}/internal/models`)).status, 500);
 });
 
+async function listedIds(modelList: string[]) {
+  const listed = createService({
+    logger,
+    routes: routes({ store, catalog, modelList }),
+    drainDelayMs: 0,
+  });
+  const address = await listed.listen(0);
+  try {
+    const response = await fetch(`http://127.0.0.1:${String(address.port)}/internal/models`);
+    assert.equal(response.status, 200);
+    return ModelListResultV1.parse(await response.json()).items.map((item) => item.id);
+  } finally {
+    await listed.close();
+  }
+}
+
 test("the model list has at most the contract limit of items", async () => {
   userModels = Array.from({ length: maxModels + 1 }, (_, i) => ({
     id: `mock/m${String(i).padStart(4, "0")}`,
@@ -124,6 +141,20 @@ test("the model list has at most the contract limit of items", async () => {
   const body = ModelListResultV1.parse(await response.json());
   assert.equal(body.items.length, maxModels);
   assert.equal(body.items.at(-1)?.id, "mock/m0999");
+  assert.deepEqual(await listedIds(["mock/m1000", "mock/m0000"]), ["mock/m0000", "mock/m1000"]);
+});
+
+test("a model list in the config keeps only its usable models, still sorted by name", async () => {
+  userModels = [
+    { id: "mock/zeta", name: "Zeta", pricing },
+    { id: "mock/alpha", name: "Alpha", pricing },
+    { id: "mock/beta", pricing },
+    { id: "mock/fee", name: "Fee", pricing: { ...pricing, new_fee: "0.01" } },
+  ];
+  assert.deepEqual(await listedIds(["mock/zeta", "mock/fee", "mock/alpha", "mock/gone"]), [
+    "mock/alpha",
+    "mock/zeta",
+  ]);
 });
 
 test("the config has the defaults and needs the API key", () => {
@@ -139,6 +170,19 @@ test("the config has the defaults and needs the API key", () => {
   assert.equal(config.OPENROUTER_BASE_URL, "https://openrouter.ai/api/v1");
   assert.equal(config.OPENROUTER_ZDR, "true");
   assert.deepEqual(config.NATS_SERVERS, ["nats://a", "nats://b"]);
+  assert.deepEqual(config.MODEL_LIST, []);
+  const list = (value: string) => ({ ...env, OPENROUTER_API_KEY: "k", MODEL_LIST: value });
+  assert.deepEqual(envSchema.parse(list(" ")).MODEL_LIST, []);
+  assert.deepEqual(envSchema.parse(list("anthropic/claude-opus-5.5, mock/a:free,")).MODEL_LIST, [
+    "anthropic/claude-opus-5.5",
+    "mock/a:free",
+  ]);
+  assert.throws(
+    () => loadConfig(envSchema, list("anthropic/claude-opus-5.5,opus")),
+    (error: unknown) =>
+      error instanceof ConfigError &&
+      error.message === "The configuration is not valid: MODEL_LIST.1: Not a model id: opus",
+  );
   const base = (url: string) =>
     envSchema.safeParse({ ...env, OPENROUTER_API_KEY: "k", OPENROUTER_BASE_URL: url }).success;
   assert.equal(base("https://openrouter.example/api/v1"), true);
