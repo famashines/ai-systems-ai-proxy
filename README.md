@@ -173,8 +173,9 @@ From `ai-systems-docs/research/openrouter.md` (M2-01), which has the sources:
   means `none` is refused).
 - `GET /api/v1/models/user` with the key: the same entry shape, only the
   models that the key can use (the provider preferences, privacy settings
-  and guardrails of the account). The owner limits the list with a
-  guardrail allow-list.
+  and guardrails of the account). ai-proxy limits the list with
+  `MODEL_LIST`, not with a guardrail: a guardrail limits the key, so it
+  also blocks the models of the agents (ADR 0031).
 - Request fields sent: `model`, `messages`, `max_tokens`, `reasoning`
   (only with an effort), `stream`,
   `service_tier: "default"` (keeps priority endpoints out of the pool),
@@ -205,7 +206,13 @@ not cover is not in the list, because a call fails it with `invalid`. The
 list is sorted by `name` and has at most 1000 items (the limit of
 `ModelListResultV1`); ai-proxy drops the items after the first 1000. 503
 when the list is not available, also when MongoDB is down and the pod has
-no list in memory. ai-proxy makes `efforts` from the `reasoning` object:
+no list in memory. When `MODEL_LIST` is set, the list has only the
+models in it, after the price check and before the limit of 1000. A
+listed id that is not in the user models list is not in the result. An
+id that is not a model id stops the start with a config error. The call
+path does not use `MODEL_LIST`: a `CallRequested` can use each model of
+the catalog, so the models of the agents (Auto) keep working (ADR 0031).
+ai-proxy makes `efforts` from the `reasoning` object:
 
 - `efforts` is always an array, highest effort first.
 - `supported_efforts: null` gives all 7 values of `ReasoningEffort`.
@@ -233,6 +240,7 @@ Environment variables (`.env.example` has all of them):
 | `OPENROUTER_API_KEY`                                                | required                       | Secret `ai-systems-ai-proxy-openrouter`, key `OPENROUTER_API_KEY`    |
 | `OPENROUTER_BASE_URL`                                               | `https://openrouter.ai/api/v1` | `https` only; `http` only for `localhost` and `127.0.0.1` (the mock) |
 | `OPENROUTER_ZDR`                                                    | `true`                         | `provider.zdr` on each request (`true` or `false`)                   |
+| `MODEL_LIST`                                                        | not set (no filter)            | Model ids, comma-separated, for `/internal/models` (Model list)      |
 | `PORT`, `LOG_LEVEL`, `RELEASE`                                      | `8080`, `info`, `local`        | As in the kit                                                        |
 | `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | not set                        | Traces go over OTLP only when one is set                             |
 

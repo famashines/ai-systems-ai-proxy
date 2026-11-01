@@ -19,10 +19,13 @@ export const maxModels = 1000;
 export function routes({
   store,
   catalog,
+  modelList = [],
 }: {
   store: EventStore;
   catalog: Pick<Catalog, "userModels">;
+  modelList?: readonly string[];
 }): Route[] {
+  const listed = new Set(modelList);
   return [
     {
       method: "GET",
@@ -48,6 +51,7 @@ export function routes({
         if (models === "unavailable") throw new UnavailableError("The model list is not available");
         const items: ModelListResultV1["items"] = models
           .filter((model) => uncoveredPrice(model.pricing) === undefined)
+          .filter((model) => listed.size === 0 || listed.has(model.id))
           .map(({ id, name, efforts, defaultEffort }) => ({
             id,
             name: name ?? id,

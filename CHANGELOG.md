@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `MODEL_LIST` (optional): model ids, comma-separated. When it is set,
+  `GET /internal/models` has only these models (after the price check,
+  sorted by name, at most 1000). Not set or empty: no filter, as before.
+  An id that is not a model id stops the start with a config error. The
+  call path does not change, so the models of the agents keep working
+  (ADR 0031).
 - Contracts v0.5.0. A `CallRequested` can have `maxTokens` up to 32000
   and an `effort`. Deploy this before the other services move to v0.5.0.
 - The `effort` of a `CallRequested` goes to OpenRouter as
